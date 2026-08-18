@@ -211,5 +211,5 @@ summary { cursor: pointer; color: #cfd6e9; }
   .leaderboard { width: 146px; padding: 9px; }
   .leaderboard-mass { display: none; }
   .leaderboard-row { grid-template-columns: 16px minmax(0, 1fr); }
-  .players-card { display: none; }
+  .players-card { display: block; order: 4; flex-basis: 100%; }
 }

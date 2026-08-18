@@ -1,4 +1,4 @@
-// Blob Buddies — 2-player Agar.io-inspired co-op with synchronized splitting enemy bots.
+// Blob Buddies — 2-player Agar.io-inspired co-op with synchronized personality-driven splitting enemy bots.
 // Firebase Web SDK 12.17.1 via Google's CDN.
 
 import { initializeApp } from "https://www.gstatic.com/firebasejs/12.17.1/firebase-app.js";
@@ -26,9 +26,11 @@ const firebaseConfig = {
   appId: "1:257019969127:web:0a910b0fe08fde4d60dec2",
 };
 
-const BUILD_VERSION = "1.4.0-bigworld";
-const WORLD = { width: 9000, height: 6000 };
-const FOOD_TARGET = 500;
+const BUILD_VERSION = "1.5.0-personality";
+const WORLD = { width: 3000, height: 2000 };
+const FOOD_TARGET = 220;
+const SPIKY_FOOD_CHANCE = 0.025;
+const SPIKY_FOOD_MASS = 25;
 const TEAM_GOAL = 5000;
 const START_RADIUS = 30;
 
@@ -38,7 +40,7 @@ const PLAYER_SPLIT_BOOST = 650;
 const PLAYER_MERGE_MS = 6500;
 const PLAYER_SPLIT_COOLDOWN_MS = 350;
 
-const BOT_FAMILY_COUNT = 50;
+const BOT_FAMILY_COUNT = 40;
 const BOT_EAT_RATIO = 1.14;
 const BOT_RESPAWN_MIN_RADIUS = 22;
 const BOT_RESPAWN_MAX_RADIUS = 43;
@@ -47,10 +49,16 @@ const BOT_SPLIT_MIN_RADIUS = 42;
 const BOT_SPLIT_BOOST = 590;
 const BOT_MERGE_MS = 7000;
 
+// Displayed size/mass is radius² / 100, so radius 1000 = size 10,000.
+const MAX_CELL_MASS = 10000;
+const MAX_CELL_RADIUS = Math.sqrt(MAX_CELL_MASS * 100);
+
 const COLORS = ["#72e7ff", "#a78bfa"];
 const FOOD_COLORS = ["#75f0ba", "#ffd166", "#ff7aa8", "#7bdff2", "#b8f2e6", "#cdb4ff"];
 const BOT_COLORS = ["#ff5f6d", "#ff8c42", "#ff477e", "#ef476f", "#f78c6b", "#ff6b6b", "#f25f5c", "#e85d75"];
 const BOT_NAMES = ["Chomper", "Razor", "Glitch", "NomNom", "Viper", "Crimson", "Munch", "Hunter"];
+const BOT_PERSONALITIES = ["hunter", "rival", "chaos", "dumb"];
+const BOT_PERSONALITY_LABELS = { hunter: "Hunter", rival: "Rival", chaos: "Chaos", dumb: "Dumb" };
 
 const canvas = document.querySelector("#game");
 const ctx = canvas.getContext("2d");
@@ -153,11 +161,14 @@ function makeFood(count = FOOD_TARGET) {
   const food = {};
   for (let i = 0; i < count; i++) {
     const id = crypto.randomUUID().replaceAll("-", "").slice(0, 12);
+    const spiky = Math.random() < SPIKY_FOOD_CHANCE;
     food[id] = {
       x: 45 + Math.random() * (WORLD.width - 90),
       y: 45 + Math.random() * (WORLD.height - 90),
-      r: 6 + Math.random() * 4,
-      color: FOOD_COLORS[Math.floor(Math.random() * FOOD_COLORS.length)],
+      r: spiky ? 16 + Math.random() * 3 : 6 + Math.random() * 4,
+      color: spiky ? "#f5ff72" : FOOD_COLORS[Math.floor(Math.random() * FOOD_COLORS.length)],
+      kind: spiky ? "spiky" : "normal",
+      mass: spiky ? SPIKY_FOOD_MASS : 0,
     };
   }
   return food;
@@ -167,9 +178,11 @@ function makeBot(index = 0, id = `bot${index}`) {
   const angle = Math.random() * Math.PI * 2;
   const radius = BOT_RESPAWN_MIN_RADIUS + Math.random() * (BOT_RESPAWN_MAX_RADIUS - BOT_RESPAWN_MIN_RADIUS);
   const now = Date.now();
+  const personality = BOT_PERSONALITIES[index % BOT_PERSONALITIES.length];
   return {
     family: `bot${index}`,
-    name: `${BOT_NAMES[index % BOT_NAMES.length]} ${String(index + 1).padStart(2, "0")}`,
+    name: `${BOT_PERSONALITY_LABELS[personality]} ${BOT_NAMES[index % BOT_NAMES.length]} ${String(index + 1).padStart(2, "0")}`,
+    personality,
     x: 100 + Math.random() * (WORLD.width - 200),
     y: 100 + Math.random() * (WORLD.height - 200),
     radius: Math.round(radius * 100) / 100,
@@ -178,7 +191,7 @@ function makeBot(index = 0, id = `bot${index}`) {
     vy: Math.sin(angle),
     boostX: 0,
     boostY: 0,
-    turnAt: now + 1000 + Math.floor(Math.random() * 2600),
+    turnAt: now + 700 + Math.floor(Math.random() * 2600),
     mergeAt: 0,
     splitReadyAt: now + 1800 + Math.floor(Math.random() * 2800),
   };
@@ -221,7 +234,7 @@ function syncLocalAggregate() {
   const aggregate = aggregatePieces(local.pieces);
   local.x = aggregate.x;
   local.y = aggregate.y;
-  local.radius = Math.min(400, aggregate.radius);
+  local.radius = Math.min(MAX_CELL_RADIUS, aggregate.radius);
 }
 
 function publicPlayerPayload() {
@@ -460,6 +473,14 @@ function teamMass(players) {
   return Object.values(players).reduce((sum, p) => sum + playerMass(p), 0);
 }
 
+function growRadiusFromFood(radius, food, normalFactor = 0.82) {
+  const currentArea = Math.max(1, radius ** 2);
+  if (food?.kind === "spiky" || Number(food?.mass) === SPIKY_FOOD_MASS) {
+    return Math.sqrt(currentArea + SPIKY_FOOD_MASS * 100);
+  }
+  return Math.sqrt(currentArea + (food?.r || 7) ** 2 * normalFactor);
+}
+
 function botFamilyMasses(bots = {}) {
   const families = new Map();
   const source = localHost && hostBots.size ? Object.fromEntries(hostBots) : bots;
@@ -531,8 +552,10 @@ function updateHud(players, bots = {}) {
     dot.className = "dot";
     dot.style.background = p.color || "#fff";
     const text = document.createElement("span");
-    const cells = Object.keys(piecesOf(p)).length;
-    text.textContent = `${p.name || "Buddy"}${p.uid === uid ? " (you)" : ""} · ${cells} cell${cells === 1 ? "" : "s"}`;
+    const source = p.uid === uid && local ? { ...p, pieces: local.pieces, x: local.x, y: local.y, radius: local.radius } : p;
+    const cells = Object.keys(piecesOf(source)).length;
+    const size = playerMass(source);
+    text.textContent = `${p.name || "Buddy"}${p.uid === uid ? " (you)" : ""} · SIZE ${size} · ${cells} cell${cells === 1 ? "" : "s"}`;
     line.append(dot, text);
     playersList.append(line);
   });
@@ -646,7 +669,7 @@ function resolvePlayerPieceInteractions(dt) {
         const total = areaA + areaB;
         a.x = (a.x * areaA + b.x * areaB) / total;
         a.y = (a.y * areaA + b.y * areaB) / total;
-        a.radius = Math.sqrt(total);
+        a.radius = Math.min(MAX_CELL_RADIUS, Math.sqrt(total));
         a.vx = ((a.vx || 0) * areaA + (b.vx || 0) * areaB) / total;
         a.vy = ((a.vy || 0) * areaA + (b.vy || 0) * areaB) / total;
         a.mergeAt = 0;
@@ -742,7 +765,7 @@ async function claimFood(foodId, food, pieceId) {
 
     if (result.committed && result.snapshot.val()?.claimedBy === uid) {
       const piece = local?.pieces?.[pieceId];
-      if (piece) piece.radius = Math.sqrt(piece.radius ** 2 + (food.r || 7) ** 2 * 0.82);
+      if (piece) piece.radius = Math.min(MAX_CELL_RADIUS, growRadiusFromFood(piece.radius, food, 0.82));
       syncLocalAggregate();
       await remove(foodRef);
     }
@@ -788,7 +811,7 @@ async function claimBot(botId, bot, pieceId) {
 
     if (result.committed && result.snapshot.val()?.eatenBy === uid) {
       const piece = local?.pieces?.[pieceId];
-      if (piece) piece.radius = Math.min(400, Math.sqrt(piece.radius ** 2 + (bot.radius || 28) ** 2 * 0.72));
+      if (piece) piece.radius = Math.min(MAX_CELL_RADIUS, Math.sqrt(piece.radius ** 2 + (bot.radius || 28) ** 2 * 0.72));
       syncLocalAggregate();
     }
   } catch (err) {
@@ -842,7 +865,7 @@ async function botClaimFood(botId, foodId, food) {
 
     if (result.committed && result.snapshot.val()?.claimedBy === marker) {
       const sim = hostBots.get(botId);
-      if (sim) sim.radius = Math.min(260, Math.sqrt(sim.radius ** 2 + (food.r || 7) ** 2 * 0.68));
+      if (sim) sim.radius = Math.min(MAX_CELL_RADIUS, growRadiusFromFood(sim.radius, food, 0.68));
       await remove(foodRef);
     }
   } catch (err) {
@@ -952,7 +975,7 @@ function mergeBotCells(bigId, big, smallId, small) {
   const total = areaA + areaB;
   big.x = (big.x * areaA + small.x * areaB) / total;
   big.y = (big.y * areaA + small.y * areaB) / total;
-  big.radius = Math.min(260, Math.sqrt(total));
+  big.radius = Math.min(MAX_CELL_RADIUS, Math.sqrt(total));
   big.boostX = 0;
   big.boostY = 0;
   big.mergeAt = 0;
@@ -1011,64 +1034,116 @@ function tickBots(dt, now) {
   ensureHostBots();
   if (!hostBots.size) return;
 
-  const targets = allPlayerTargets();
+  const playerTargets = allPlayerTargets();
   const food = roomState.food || {};
   const entriesAtStart = [...hostBots.entries()];
+  const wallMargin = 150;
 
   for (const [botId, bot] of entriesAtStart) {
     if (!hostBots.has(botId) || botRemoving.has(botId)) continue;
 
+    const personality = bot.personality || BOT_PERSONALITIES[botIndexFromFamily(bot.family) % BOT_PERSONALITIES.length] || "dumb";
+    bot.personality = personality;
     let dirX = bot.vx || 1;
     let dirY = bot.vy || 0;
     let threat = null;
     let threatDist = Infinity;
-    let prey = null;
-    let preyDist = Infinity;
+    let playerPrey = null;
+    let playerPreyDist = Infinity;
+    let botPrey = null;
+    let botPreyDist = Infinity;
 
-    for (const p of targets) {
+    // Smarter bots understand both players and enemy bot families. Dumb/chaos bots
+    // only notice danger at much shorter range.
+    const threatRange = personality === "dumb" ? 260 : personality === "chaos" ? 420 : 760;
+    for (const p of playerTargets) {
       const d = Math.hypot(p.x - bot.x, p.y - bot.y);
-      if (p.radius > bot.radius * BOT_EAT_RATIO && d < 720 && d < threatDist) { threat = p; threatDist = d; }
-      if (bot.radius > p.radius * BOT_EAT_RATIO && d < 880 && d < preyDist) { prey = p; preyDist = d; }
+      if (p.radius > bot.radius * BOT_EAT_RATIO && d < threatRange && d < threatDist) { threat = p; threatDist = d; }
+      if (bot.radius > p.radius * BOT_EAT_RATIO && d < 950 && d < playerPreyDist) { playerPrey = p; playerPreyDist = d; }
+    }
+
+    if (personality === "hunter" || personality === "rival") {
+      for (const [otherId, other] of hostBots) {
+        if (otherId === botId || !other || other.eatenBy || other.family === bot.family) continue;
+        const d = Math.hypot(other.x - bot.x, other.y - bot.y);
+        if (other.radius > bot.radius * BOT_EAT_RATIO && d < 700 && d < threatDist) {
+          threat = other; threatDist = d;
+        }
+        if (bot.radius > other.radius * BOT_EAT_RATIO && d < 920 && d < botPreyDist) {
+          botPrey = other; botPreyDist = d;
+        }
+      }
     }
 
     if (threat) {
       dirX = bot.x - threat.x;
       dirY = bot.y - threat.y;
-    } else if (prey) {
-      dirX = prey.x - bot.x;
-      dirY = prey.y - bot.y;
-
-      // Aggressive bots use a split attack when they have enough mass and a clear target.
-      if (preyDist > bot.radius * 1.45 && preyDist < 430 && bot.radius > prey.radius * 1.46) {
+    } else if (personality === "hunter" && playerPrey) {
+      // Hunter bots prioritize the human team and deliberately split-attack.
+      dirX = playerPrey.x - bot.x;
+      dirY = playerPrey.y - bot.y;
+      if (playerPreyDist > bot.radius * 1.4 && playerPreyDist < 470 && bot.radius > playerPrey.radius * 1.43) {
         splitBot(botId, bot, dirX, dirY);
       }
+    } else if (personality === "rival" && (botPrey || playerPrey)) {
+      // Rival bots prefer eating other bot families, then fall back to players.
+      const prey = botPrey || playerPrey;
+      const preyDist = botPrey ? botPreyDist : playerPreyDist;
+      dirX = prey.x - bot.x;
+      dirY = prey.y - bot.y;
+      if (preyDist > bot.radius * 1.4 && preyDist < 450 && bot.radius > prey.radius * 1.45) {
+        splitBot(botId, bot, dirX, dirY);
+      }
+    } else if (personality !== "dumb" && playerPrey && personality !== "chaos") {
+      dirX = playerPrey.x - bot.x;
+      dirY = playerPrey.y - bot.y;
     } else {
       let nearestFood = null;
-      let nearestFoodDist = 560;
-      for (const f of Object.values(food)) {
-        if (!f || f.claimedBy) continue;
-        const d = Math.hypot(f.x - bot.x, f.y - bot.y);
-        if (d < nearestFoodDist) { nearestFood = f; nearestFoodDist = d; }
+      let nearestFoodDist = personality === "dumb" ? 280 : 520;
+      // Dumb bots are bad at choosing food; chaos bots are slightly better but unstable.
+      if (personality !== "dumb" || Math.random() < 0.35) {
+        for (const f of Object.values(food)) {
+          if (!f || f.claimedBy) continue;
+          const d = Math.hypot(f.x - bot.x, f.y - bot.y);
+          if (d < nearestFoodDist) { nearestFood = f; nearestFoodDist = d; }
+        }
       }
-      if (nearestFood) {
+      if (nearestFood && personality !== "chaos") {
         dirX = nearestFood.x - bot.x;
         dirY = nearestFood.y - bot.y;
       } else if (Date.now() >= (bot.turnAt || 0)) {
         const angle = Math.random() * Math.PI * 2;
         dirX = Math.cos(angle);
         dirY = Math.sin(angle);
-        bot.turnAt = Date.now() + 1200 + Math.floor(Math.random() * 3200);
+        const turnMin = personality === "dumb" ? 450 : personality === "chaos" ? 650 : 1100;
+        const turnSpread = personality === "dumb" ? 1300 : personality === "chaos" ? 1700 : 2800;
+        bot.turnAt = Date.now() + turnMin + Math.floor(Math.random() * turnSpread);
       }
     }
 
+    // Chaos bots split in random directions for no good reason. Dumb bots do it rarely too.
+    const randomSplitRate = personality === "chaos" ? 0.22 : personality === "dumb" ? 0.035 : 0;
+    if (randomSplitRate && bot.radius >= BOT_SPLIT_MIN_RADIUS && Date.now() >= (bot.splitReadyAt || 0) && Math.random() < randomSplitRate * dt) {
+      const angle = Math.random() * Math.PI * 2;
+      splitBot(botId, bot, Math.cos(angle), Math.sin(angle));
+    }
+
+    // Basic wall awareness keeps all personalities from spending too long pressed against an edge.
+    if (bot.x < wallMargin) dirX += 1.8;
+    if (bot.x > WORLD.width - wallMargin) dirX -= 1.8;
+    if (bot.y < wallMargin) dirY += 1.8;
+    if (bot.y > WORLD.height - wallMargin) dirY -= 1.8;
+
     const mag = Math.hypot(dirX, dirY) || 1;
-    bot.vx += (dirX / mag - bot.vx) * Math.min(1, dt * 3.2);
-    bot.vy += (dirY / mag - bot.vy) * Math.min(1, dt * 3.2);
+    const steering = personality === "dumb" ? 1.2 : personality === "chaos" ? 2.0 : 3.6;
+    bot.vx += (dirX / mag - bot.vx) * Math.min(1, dt * steering);
+    bot.vy += (dirY / mag - bot.vy) * Math.min(1, dt * steering);
     const vmag = Math.hypot(bot.vx, bot.vy) || 1;
     bot.vx /= vmag;
     bot.vy /= vmag;
 
-    const speed = Math.max(72, 238 - bot.radius * 1.65) * (threat ? 1.16 : 1);
+    const speedBase = personality === "hunter" ? 250 : personality === "rival" ? 242 : personality === "chaos" ? 232 : 218;
+    const speed = Math.max(66, speedBase - bot.radius * 1.45) * (threat ? 1.18 : 1);
     bot.x += bot.vx * speed * dt + (bot.boostX || 0) * dt;
     bot.y += bot.vy * speed * dt + (bot.boostY || 0) * dt;
     const boostDrag = Math.pow(0.03, dt);
@@ -1105,7 +1180,7 @@ function tickBots(dt, now) {
       else if (b.radius > a.radius * BOT_EAT_RATIO) [bigId, big, smallId, small] = [idB, b, idA, a];
       else continue;
       if (d < big.radius - small.radius * 0.12) {
-        big.radius = Math.min(260, Math.sqrt(big.radius ** 2 + small.radius ** 2 * 0.64));
+        big.radius = Math.min(MAX_CELL_RADIUS, Math.sqrt(big.radius ** 2 + small.radius ** 2 * 0.64));
         hostBots.set(bigId, big);
         deleteBotCell(smallId);
       }
@@ -1121,6 +1196,7 @@ function tickBots(dt, now) {
       if (botRemoving.has(id)) continue;
       patch[`bots/${id}/family`] = bot.family;
       patch[`bots/${id}/name`] = bot.name;
+      patch[`bots/${id}/personality`] = bot.personality || "dumb";
       patch[`bots/${id}/x`] = Math.round(bot.x * 10) / 10;
       patch[`bots/${id}/y`] = Math.round(bot.y * 10) / 10;
       patch[`bots/${id}/radius`] = Math.round(bot.radius * 100) / 100;
@@ -1181,7 +1257,40 @@ function drawFood(cam) {
     if (f.claimedBy) continue;
     const x = f.x - cam.x;
     const y = f.y - cam.y;
-    if (x < -20 || y < -20 || x > innerWidth + 20 || y > innerHeight + 20) continue;
+    if (x < -28 || y < -28 || x > innerWidth + 28 || y > innerHeight + 28) continue;
+
+    if (f.kind === "spiky" || Number(f.mass) === SPIKY_FOOD_MASS) {
+      const outer = f.r || 17;
+      const inner = outer * 0.55;
+      ctx.save();
+      ctx.translate(x, y);
+      ctx.shadowColor = f.color || "#f5ff72";
+      ctx.shadowBlur = 16;
+      ctx.beginPath();
+      const spikes = 12;
+      for (let i = 0; i < spikes * 2; i++) {
+        const angle = -Math.PI / 2 + i * Math.PI / spikes;
+        const radius = i % 2 === 0 ? outer : inner;
+        const px = Math.cos(angle) * radius;
+        const py = Math.sin(angle) * radius;
+        if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+      }
+      ctx.closePath();
+      ctx.fillStyle = f.color || "#f5ff72";
+      ctx.fill();
+      ctx.shadowBlur = 0;
+      ctx.lineWidth = 2;
+      ctx.strokeStyle = "rgba(255,255,255,.72)";
+      ctx.stroke();
+      ctx.font = "900 8px Inter, system-ui, sans-serif";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillStyle = "rgba(35,42,5,.88)";
+      ctx.fillText("25", 0, 0.5);
+      ctx.restore();
+      continue;
+    }
+
     ctx.beginPath();
     ctx.arc(x, y, f.r, 0, Math.PI * 2);
     ctx.fillStyle = f.color || "#fff";
