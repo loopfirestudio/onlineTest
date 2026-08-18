@@ -1,5 +1,5 @@
 // Blob Buddies — 2-player Agar.io-inspired co-op with synchronized personality-driven splitting enemy bots.
-// Build 1.6 adds a larger arena plus collision/eating reliability fixes.
+// Build 1.7 fixes host-authoritative eating and reduces CPU/GPU work for large cells.
 // Firebase Web SDK 12.17.1 via Google's CDN.
 
 import { initializeApp } from "https://www.gstatic.com/firebasejs/12.17.1/firebase-app.js";
@@ -27,8 +27,8 @@ const firebaseConfig = {
   appId: "1:257019969127:web:0a910b0fe08fde4d60dec2",
 };
 
-const BUILD_VERSION = "1.6.0-polished";
-const WORLD = { width: 6000, height: 4000 };
+const BUILD_VERSION = "1.7.0-performance";
+const WORLD = { width: 5000, height: 4000 };
 const FOOD_TARGET = 400;
 const SPIKY_FOOD_CHANCE = 0.025;
 const SPIKY_FOOD_MASS = 25;
@@ -41,7 +41,7 @@ const PLAYER_SPLIT_BOOST = 650;
 const PLAYER_MERGE_MS = 6500;
 const PLAYER_SPLIT_COOLDOWN_MS = 350;
 
-const BOT_FAMILY_COUNT = 40;
+const BOT_FAMILY_COUNT = 20;
 const BOT_EAT_RATIO = 1.10;
 const EAT_OVERLAP_FACTOR = 0.18;
 const BOT_RESPAWN_MIN_RADIUS = 22;
@@ -50,6 +50,17 @@ const BOT_MAX_FAMILY_CELLS = 4;
 const BOT_SPLIT_MIN_RADIUS = 42;
 const BOT_SPLIT_BOOST = 590;
 const BOT_MERGE_MS = 7000;
+
+// Performance tuning: AI does not need to run at display refresh rate. Rendering
+// stays at requestAnimationFrame speed while host AI is capped near 30 Hz.
+const BOT_SIM_INTERVAL_MS = 34;
+const PLAYER_NETWORK_INTERVAL_MS = 65;
+const BOT_NETWORK_INTERVAL_MS = 125;
+const LARGE_CELL_LOD_RADIUS = 180;
+const MAX_CONCURRENT_FOOD_CLAIMS = 10;
+const MAX_NEW_FOOD_CLAIMS_PER_TICK = 3;
+const MAX_CONCURRENT_BOT_FOOD_CLAIMS = 8;
+const MAX_BOT_EATS_PER_TICK = 4;
 
 // Displayed size/mass is radius² / 100, so radius 1000 = size 10,000.
 const MAX_CELL_MASS = 10000;
@@ -102,6 +113,7 @@ let localHost = false;
 let lastNetworkWrite = 0;
 let hostLoopAt = 0;
 let lastBotNetworkWrite = 0;
+let lastBotSimAt = 0;
 let eating = new Set();
 let botEating = new Set();
 let botClaiming = new Set();
@@ -360,6 +372,8 @@ async function enterRoom(code, player, slot) {
   localSlot = slot;
   won = false;
   previousPlayerCount = 0;
+  lastBotSimAt = 0;
+  lastBotNetworkWrite = 0;
   renderPlayerPieces.clear();
   renderBots.clear();
   hostBots.clear();
@@ -397,6 +411,8 @@ async function enterRoom(code, player, slot) {
       hostBots.clear();
       botRespawnAt.clear();
       botMealProcessing.clear();
+      lastBotSimAt = 0;
+      lastBotNetworkWrite = 0;
     }
 
     if ((!meta.hostUid || !hostPresent) && selfPresent) {
@@ -459,6 +475,8 @@ async function leaveRoom(removeSelf = true) {
   invulnerableUntil = 0;
   deathNoticeUntil = 0;
   previousPlayerCount = 0;
+  lastBotSimAt = 0;
+  lastBotNetworkWrite = 0;
   hideBanner();
   hud.classList.add("hidden");
   leaderboard?.classList.add("hidden");
@@ -499,9 +517,11 @@ function canConsume(bigRadius, smallRadius, distance, ratio = BOT_EAT_RATIO) {
   return distance <= bigRadius - smallRadius * EAT_OVERLAP_FACTOR;
 }
 
-function collisionBotsSource() {
-  if (localHost && hostBots.size) return Object.fromEntries(hostBots);
-  return roomState?.bots || {};
+function canConsumeSquared(bigRadius, smallRadius, distanceSq, ratio = BOT_EAT_RATIO) {
+  if (!Number.isFinite(bigRadius) || !Number.isFinite(smallRadius) || !Number.isFinite(distanceSq)) return false;
+  if (bigRadius < smallRadius * ratio) return false;
+  const threshold = bigRadius - smallRadius * EAT_OVERLAP_FACTOR;
+  return threshold > 0 && distanceSq <= threshold * threshold;
 }
 
 function botFamilyMasses(bots = {}) {
@@ -748,7 +768,7 @@ function tickMovement(dt) {
   syncLocalAggregate();
 
   const now = performance.now();
-  if (now - lastNetworkWrite > 55) {
+  if (now - lastNetworkWrite > PLAYER_NETWORK_INTERVAL_MS) {
     lastNetworkWrite = now;
     update(ref(db, `rooms/${roomId}/players/${localSlot}`), publicPlayerPayload()).catch(console.warn);
   }
@@ -763,15 +783,24 @@ function writeLocalNow() {
 }
 
 function checkFoodCollisions() {
+  if (eating.size >= MAX_CONCURRENT_FOOD_CLAIMS) return;
   const food = roomState?.food || {};
+  const pieces = Object.entries(local.pieces || {});
+  if (!pieces.length) return;
+  let started = 0;
+
   for (const [foodId, f] of Object.entries(food)) {
-    if (f.claimedBy || eating.has(foodId)) continue;
-    for (const [pieceId, piece] of Object.entries(local.pieces || {})) {
-      const dist = Math.hypot(piece.x - f.x, piece.y - f.y);
-      if (dist < piece.radius + f.r * 0.6) {
-        claimFood(foodId, f, pieceId);
-        break;
-      }
+    if (!f || f.claimedBy || eating.has(foodId)) continue;
+    for (const [pieceId, piece] of pieces) {
+      const reach = piece.radius + (f.r || 7) * 0.6;
+      const dx = piece.x - f.x;
+      if (Math.abs(dx) > reach) continue;
+      const dy = piece.y - f.y;
+      if (Math.abs(dy) > reach || dx * dx + dy * dy >= reach * reach) continue;
+      claimFood(foodId, f, pieceId);
+      started++;
+      if (started >= MAX_NEW_FOOD_CLAIMS_PER_TICK || eating.size >= MAX_CONCURRENT_FOOD_CLAIMS) return;
+      break;
     }
   }
 }
@@ -804,33 +833,56 @@ async function claimFood(foodId, food, pieceId) {
 
 function checkBotCollisions() {
   if (!local) return;
-  const bots = collisionBotsSource();
+  const botEntries = localHost ? hostBots.entries() : Object.entries(roomState?.bots || {});
   const pieceEntries = Object.entries(local.pieces || {});
   const protectedFromBots = performance.now() < invulnerableUntil;
+  let consumedThisTick = 0;
 
-  for (const [botId, bot] of Object.entries(bots)) {
+  if (!localHost && botClaiming.size >= MAX_BOT_EATS_PER_TICK) return;
+  for (const [botId, bot] of botEntries) {
     if (!bot || bot.eatenBy || botClaiming.has(botId) || botRemoving.has(botId)) continue;
-    // Non-host clients collide with the interpolated bot position they actually see.
-    // The transaction still claims the real Firebase bot id, so ownership stays safe.
+    // Clients collide with the interpolated position they see. The host already owns
+    // the authoritative simulation, so it collides directly with hostBots.
     const rendered = !localHost ? renderBots.get(botId) : null;
     const collisionBot = rendered ? { ...bot, x: rendered.x, y: rendered.y, radius: rendered.radius } : bot;
+
     for (const [pieceId, piece] of pieceEntries) {
       if (!local.pieces?.[pieceId]) continue;
-      const dist = Math.hypot(piece.x - collisionBot.x, piece.y - collisionBot.y);
+      const dx = piece.x - collisionBot.x;
+      const dy = piece.y - collisionBot.y;
+      const distSq = dx * dx + dy * dy;
 
-      // Invulnerability only blocks incoming damage; it should never stop a player
-      // from eating an enemy that is genuinely smaller.
-      if (canConsume(piece.radius, collisionBot.radius, dist)) {
-        claimBot(botId, collisionBot, pieceId);
+      if (canConsumeSquared(piece.radius, collisionBot.radius, distSq)) {
+        if (localHost) consumeBotAsHost(botId, collisionBot, pieceId);
+        else claimBot(botId, collisionBot, pieceId);
+        consumedThisTick++;
+        if (consumedThisTick >= MAX_BOT_EATS_PER_TICK) return;
         break;
       }
 
-      if (!protectedFromBots && canConsume(collisionBot.radius, piece.radius, dist)) {
+      if (!protectedFromBots && canConsumeSquared(collisionBot.radius, piece.radius, distSq)) {
         eatenByBot(pieceId, botId, collisionBot);
         break;
       }
     }
   }
+}
+
+function consumeBotAsHost(botId, bot, pieceId) {
+  if (!localHost || !local?.pieces?.[pieceId] || botClaiming.has(botId) || botRemoving.has(botId)) return;
+  const liveBot = hostBots.get(botId);
+  if (!liveBot || liveBot.eatenBy) return;
+
+  // The host is the bot authority. Avoid a Firebase transaction here because the
+  // host's own movement updates would conflict with that transaction. Removing the
+  // bot from hostBots first also guarantees it cannot damage/eat anything again.
+  botClaiming.add(botId);
+  const piece = local.pieces[pieceId];
+  piece.radius = Math.min(MAX_CELL_RADIUS, Math.sqrt(piece.radius ** 2 + liveBot.radius ** 2 * 0.72));
+  syncLocalAggregate();
+  writeLocalNow();
+  deleteBotCell(botId, liveBot.family);
+  queueMicrotask(() => botClaiming.delete(botId));
 }
 
 async function claimBot(botId, bot, pieceId) {
@@ -904,7 +956,7 @@ function eatenByBot(pieceId, botId, bot) {
 
 async function botClaimFood(botId, foodId, food) {
   const key = `${botId}:${foodId}`;
-  if (!roomId || botEating.has(key)) return;
+  if (!roomId || botEating.has(key) || botEating.size >= MAX_CONCURRENT_BOT_FOOD_CLAIMS) return;
   botEating.add(key);
   const foodRef = ref(db, `rooms/${roomId}/food/${foodId}`);
   try {
@@ -981,6 +1033,12 @@ function ensureHostBots() {
 
   for (const [id, bot] of Object.entries(remoteBots)) {
     if (!bot) continue;
+    const familyIndex = botIndexFromFamily(bot.family || id);
+    if (familyIndex >= BOT_FAMILY_COUNT) {
+      // Automatically clean up surplus families from rooms created by older builds.
+      if (!botRemoving.has(id)) deleteBotCell(id, bot.family);
+      continue;
+    }
     if (bot.eatenBy) {
       deleteBotCell(id, bot.family);
       continue;
@@ -1133,6 +1191,8 @@ function tickBots(dt, now) {
 
   const playerTargets = allPlayerTargets();
   const food = roomState.food || {};
+  const foodEntries = Object.entries(food);
+  const foodValues = foodEntries.map(([, item]) => item);
   const entriesAtStart = [...hostBots.entries()];
   const wallMargin = 150;
 
@@ -1196,13 +1256,16 @@ function tickBots(dt, now) {
       dirY = playerPrey.y - bot.y;
     } else {
       let nearestFood = null;
-      let nearestFoodDist = personality === "dumb" ? 280 : 520;
+      const foodSense = personality === "dumb" ? 280 : 520;
+      let nearestFoodDistSq = foodSense * foodSense;
       // Dumb bots are bad at choosing food; chaos bots are slightly better but unstable.
       if (personality !== "dumb" || Math.random() < 0.35) {
-        for (const f of Object.values(food)) {
+        for (const f of foodValues) {
           if (!f || f.claimedBy) continue;
-          const d = Math.hypot(f.x - bot.x, f.y - bot.y);
-          if (d < nearestFoodDist) { nearestFood = f; nearestFoodDist = d; }
+          const fdx = f.x - bot.x;
+          const fdy = f.y - bot.y;
+          const d2 = fdx * fdx + fdy * fdy;
+          if (d2 < nearestFoodDistSq) { nearestFood = f; nearestFoodDistSq = d2; }
         }
       }
       if (nearestFood && personality !== "chaos") {
@@ -1252,9 +1315,13 @@ function tickBots(dt, now) {
     bot.x = Math.max(bot.radius, Math.min(WORLD.width - bot.radius, bot.x));
     bot.y = Math.max(bot.radius, Math.min(WORLD.height - bot.radius, bot.y));
 
-    for (const [foodId, f] of Object.entries(food)) {
+    for (const [foodId, f] of foodEntries) {
       if (!f || f.claimedBy) continue;
-      if (Math.hypot(bot.x - f.x, bot.y - f.y) < bot.radius + f.r * 0.35) {
+      const reach = bot.radius + (f.r || 7) * 0.35;
+      const fdx = bot.x - f.x;
+      if (Math.abs(fdx) > reach) continue;
+      const fdy = bot.y - f.y;
+      if (Math.abs(fdy) <= reach && fdx * fdx + fdy * fdy < reach * reach) {
         botClaimFood(botId, foodId, f);
         break;
       }
@@ -1271,10 +1338,12 @@ function tickBots(dt, now) {
     for (let j = i + 1; j < botEntries.length; j++) {
       const [idB, b] = botEntries[j];
       if (!hostBots.has(idB) || a.family === b.family) continue;
-      const d = Math.hypot(a.x - b.x, a.y - b.y);
+      const bdx = a.x - b.x;
+      const bdy = a.y - b.y;
+      const distSq = bdx * bdx + bdy * bdy;
       let bigId, big, smallId, small;
-      if (canConsume(a.radius, b.radius, d)) [bigId, big, smallId, small] = [idA, a, idB, b];
-      else if (canConsume(b.radius, a.radius, d)) [bigId, big, smallId, small] = [idB, b, idA, a];
+      if (canConsumeSquared(a.radius, b.radius, distSq)) [bigId, big, smallId, small] = [idA, a, idB, b];
+      else if (canConsumeSquared(b.radius, a.radius, distSq)) [bigId, big, smallId, small] = [idB, b, idA, a];
       else continue;
       big.radius = Math.min(MAX_CELL_RADIUS, Math.sqrt(big.radius ** 2 + small.radius ** 2 * 0.64));
       hostBots.set(bigId, big);
@@ -1284,7 +1353,7 @@ function tickBots(dt, now) {
 
   ensureBotFamilies();
 
-  if (now - lastBotNetworkWrite > 110) {
+  if (now - lastBotNetworkWrite > BOT_NETWORK_INTERVAL_MS) {
     lastBotNetworkWrite = now;
     const patch = {};
     for (const [id, bot] of hostBots) {
@@ -1429,7 +1498,7 @@ function smoothPlayerPieces(dt) {
 function smoothBots(dt) {
   const bots = roomState?.bots || {};
   const active = new Set();
-  const sourceEntries = localHost ? [...hostBots.entries()] : Object.entries(bots);
+  const sourceEntries = localHost ? hostBots.entries() : Object.entries(bots);
   for (const [id, remote] of sourceEntries) {
     if (!remote || remote.eatenBy) continue;
     active.add(id);
@@ -1448,8 +1517,8 @@ function smoothBots(dt) {
 }
 
 function drawBots(cam) {
-  const source = localHost ? Object.fromEntries(hostBots) : (roomState?.bots || {});
-  for (const [id, bot] of Object.entries(source)) {
+  const sourceEntries = localHost ? hostBots.entries() : Object.entries(roomState?.bots || {});
+  for (const [id, bot] of sourceEntries) {
     if (!bot || bot.eatenBy) continue;
     const rb = renderBots.get(id) || bot;
     const x = rb.x - cam.x;
@@ -1458,29 +1527,35 @@ function drawBots(cam) {
     if (x < -r - 30 || y < -r - 30 || x > innerWidth + r + 30 || y > innerHeight + r + 30) continue;
 
     ctx.save();
-    ctx.shadowColor = bot.color || "#ff5f6d";
-    ctx.shadowBlur = 18;
+    if (r < LARGE_CELL_LOD_RADIUS) {
+      ctx.shadowColor = bot.color || "#ff5f6d";
+      ctx.shadowBlur = 14;
+    }
     ctx.beginPath();
     ctx.arc(x, y, r, 0, Math.PI * 2);
     ctx.fillStyle = bot.color || "#ff5f6d";
     ctx.fill();
     ctx.shadowBlur = 0;
-    ctx.lineWidth = Math.max(2.5, r * 0.075);
+    ctx.lineWidth = Math.max(2.5, Math.min(12, r * 0.075));
     ctx.strokeStyle = "rgba(80, 3, 20, .72)";
     ctx.stroke();
 
-    const eyeY = y - r * 0.14;
-    const eyeGap = r * 0.28;
-    const eyeR = Math.max(2.5, r * 0.09);
-    for (const ex of [x - eyeGap, x + eyeGap]) {
-      ctx.beginPath();
-      ctx.arc(ex, eyeY, eyeR, 0, Math.PI * 2);
-      ctx.fillStyle = "rgba(255,255,255,.92)";
-      ctx.fill();
-      ctx.beginPath();
-      ctx.arc(ex, eyeY + 1, eyeR * 0.48, 0, Math.PI * 2);
-      ctx.fillStyle = "#33101a";
-      ctx.fill();
+    // Detail LOD: giant cells are expensive mostly because of multiple large
+    // alpha-blended shapes. Their silhouette/name is enough while zoomed in.
+    if (r < 340) {
+      const eyeY = y - r * 0.14;
+      const eyeGap = r * 0.28;
+      const eyeR = Math.max(2.5, r * 0.09);
+      for (const ex of [x - eyeGap, x + eyeGap]) {
+        ctx.beginPath();
+        ctx.arc(ex, eyeY, eyeR, 0, Math.PI * 2);
+        ctx.fillStyle = "rgba(255,255,255,.92)";
+        ctx.fill();
+        ctx.beginPath();
+        ctx.arc(ex, eyeY + 1, eyeR * 0.48, 0, Math.PI * 2);
+        ctx.fillStyle = "#33101a";
+        ctx.fill();
+      }
     }
 
     const fontSize = Math.max(9, Math.min(18, r * 0.38));
@@ -1488,7 +1563,7 @@ function drawBots(cam) {
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
     ctx.fillStyle = "rgba(54,7,18,.88)";
-    ctx.fillText(bot.name || "Enemy", x, y + r * 0.28);
+    ctx.fillText(bot.name || "Enemy", x, y + Math.min(r * 0.28, 90));
     ctx.restore();
   }
 }
@@ -1503,16 +1578,21 @@ function drawPlayers(cam) {
       const x = rp.x - cam.x;
       const y = rp.y - cam.y;
       const r = rp.radius;
+      if (x < -r - 30 || y < -r - 30 || x > innerWidth + r + 30 || y > innerHeight + r + 30) continue;
 
       ctx.save();
-      ctx.shadowColor = p.color || "#fff";
-      ctx.shadowBlur = p.uid === uid ? 22 : 12;
+      // Large blurred circles are one of the most expensive canvas operations.
+      // Keep the glow for normal cells, switch to a flat LOD for giant cells.
+      if (r < LARGE_CELL_LOD_RADIUS) {
+        ctx.shadowColor = p.color || "#fff";
+        ctx.shadowBlur = p.uid === uid ? 18 : 10;
+      }
       ctx.beginPath();
       ctx.arc(x, y, r, 0, Math.PI * 2);
       ctx.fillStyle = p.color || "#fff";
       ctx.fill();
       ctx.shadowBlur = 0;
-      ctx.lineWidth = Math.max(2, r * 0.07);
+      ctx.lineWidth = Math.max(2, Math.min(12, r * 0.07));
       ctx.strokeStyle = "rgba(255,255,255,.6)";
       ctx.stroke();
 
@@ -1632,7 +1712,11 @@ function frame(now) {
   const dt = Math.min(0.04, (now - lastFrame) / 1000);
   lastFrame = now;
   tickMovement(dt);
-  tickBots(dt, now);
+  if (localHost && now - lastBotSimAt >= BOT_SIM_INTERVAL_MS) {
+    const botDt = lastBotSimAt ? Math.min(0.06, (now - lastBotSimAt) / 1000) : dt;
+    lastBotSimAt = now;
+    tickBots(botDt, now);
+  }
   hostMaintenance(now);
   smoothPlayerPieces(dt);
   smoothBots(dt);
