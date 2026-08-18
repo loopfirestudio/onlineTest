@@ -1,3 +1,16 @@
+# Blob Buddies — Join Fix Build 1.3.1
+
+This build fixes `permission_denied` when the second player joins from an older/cached client.
+
+## Important
+1. Deploy the included `database.rules.json` to **Firebase Console → Realtime Database → Rules**.
+2. Upload/serve all files from this ZIP.
+3. Both players should hard-refresh the page (Ctrl+F5 / Cmd+Shift+R) or clear the site's cached data.
+4. Make a NEW room after deploying the rules.
+5. Firebase Authentication → Sign-in method → Anonymous must be enabled.
+
+The rules accept the older player schema without `pieces`; the current client automatically writes the split-cell `pieces` state after joining.
+
 # Blob Buddies — 2 Player Co-op + Splitting Enemy Bots
 
 An Agar.io-inspired browser co-op game that synchronizes two players and an enemy-bot ecosystem through **Firebase Realtime Database**.
@@ -102,3 +115,6 @@ Only the room host continuously simulates bot AI and bot splitting. A split bot 
 ## Production note
 
 This is a playable serverless prototype, not an authoritative competitive game server. A modified browser client can still cheat. For competitive gameplay, move collision/mass validation to an authoritative server and consider protections such as Firebase App Check.
+
+### RTDB rules compatibility note
+Player split pieces use the fixed IDs `p0`, `p1`, `p2`, and `p3`. This lets Realtime Database Security Rules enforce the four-piece cap without relying on an unsupported child-count function.

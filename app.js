@@ -26,6 +26,7 @@ const firebaseConfig = {
   appId: "1:257019969127:web:0a910b0fe08fde4d60dec2",
 };
 
+const BUILD_VERSION = "1.3.1-joinfix";
 const WORLD = { width: 3000, height: 2000 };
 const FOOD_TARGET = 130;
 const TEAM_GOAL = 600;
@@ -72,6 +73,8 @@ const botsCountEl = document.querySelector("#botsCount");
 const banner = document.querySelector("#banner");
 
 goalEl.textContent = String(TEAM_GOAL);
+const buildVersionEl = document.querySelector("#buildVersion");
+if (buildVersionEl) buildVersionEl.textContent = `Build ${BUILD_VERSION}`;
 
 let app;
 let auth;
@@ -440,7 +443,7 @@ async function leaveRoom(removeSelf = true) {
 function friendlyError(err) {
   const msg = err?.message || String(err);
   if (msg.includes("auth/operation-not-allowed")) return "Enable Anonymous sign-in in Firebase Authentication.";
-  if (msg.includes("PERMISSION_DENIED")) return "Firebase rules denied access. Deploy the updated database.rules.json.";
+  if (msg.toLowerCase().includes("permission_denied") || msg.toLowerCase().includes("permission denied")) return "Firebase denied the join. Deploy the JOIN-FIX database.rules.json, then hard-refresh both browsers.";
   if (msg.includes("Failed to fetch") || msg.includes("network")) return "Network connection failed.";
   return msg;
 }
@@ -538,7 +541,8 @@ function splitLocalPlayer() {
     piece.vx = (piece.vx || 0) - aim.x * 75;
     piece.vy = (piece.vy || 0) - aim.y * 75;
 
-    const newId = `p${now.toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+    const newId = ['p0', 'p1', 'p2', 'p3'].find((pieceId) => !local.pieces[pieceId]);
+    if (!newId) break;
     local.pieces[newId] = makePiece(
       Math.max(r, Math.min(WORLD.width - r, piece.x + aim.x * r * 1.35)),
       Math.max(r, Math.min(WORLD.height - r, piece.y + aim.y * r * 1.35)),
