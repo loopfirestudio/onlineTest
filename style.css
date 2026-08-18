@@ -213,3 +213,38 @@ summary { cursor: pointer; color: #cfd6e9; }
   .leaderboard-row { grid-template-columns: 16px minmax(0, 1fr); }
   .players-card { display: block; order: 4; flex-basis: 100%; }
 }
+
+
+/* Build 1.8 co-op actions */
+.action-buttons {
+  position: fixed;
+  left: 50%;
+  bottom: max(18px, env(safe-area-inset-bottom));
+  transform: translateX(-50%);
+  display: flex;
+  gap: 10px;
+  z-index: 7;
+  pointer-events: none;
+}
+.action-buttons button { pointer-events: auto; }
+.action-buttons .split,
+.action-buttons .transfer {
+  position: static;
+  transform: none;
+  min-width: 126px;
+}
+.transfer {
+  border: 1px solid rgba(117,240,186,.38);
+  background: rgba(12,36,34,.88);
+  color: #bfffe7;
+  box-shadow: 0 10px 34px rgba(0,0,0,.24);
+  backdrop-filter: blur(12px);
+}
+.transfer span { margin-left: 6px; opacity: .7; font-size: 10px; }
+.leaderboard-row.boss .leaderboard-name,
+.leaderboard-row.boss .leaderboard-mass { color: #ffe08a; font-weight: 900; }
+@media (max-width: 680px) {
+  .action-buttons { width: calc(100% - 28px); justify-content: center; }
+  .action-buttons .split, .action-buttons .transfer { min-width: 0; flex: 1 1 0; max-width: 160px; min-height: 50px; font-size: 14px; }
+  .action-buttons span { display: none; }
+}

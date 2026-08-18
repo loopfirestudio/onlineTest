@@ -1,39 +1,38 @@
-# Blob Buddies — Build 1.7.1 — 30 Bots
+# Blob Buddies — Build 1.8.0 — Co-op Bosses + Mass Transfer
 
 A 2-player Agar.io-inspired browser co-op game synchronized with Firebase Realtime Database.
 
 ## What changed in this build
 
-- Arena adjusted to **5000×4000**.
-- Enemy population is now **30 bot families**.
-- Fixed the host-side enemy eating bug. The host now consumes bots directly from its authoritative simulation instead of starting a Firebase transaction that conflicts with its own continuous bot-movement writes.
-- Client-side bot eating keeps the transaction-based claim path.
+- Arena remains **5000×4000**.
+- Enemy population remains **30 regular bot families**.
+- Added **2 co-op boss families**: Void Titan and Crimson Colossus.
+  - Each boss initially spawns as multiple huge cells.
+  - Bosses aggressively pressure the human team, can split-attack vulnerable players, grow by eating, merge again, and respawn after the whole boss family is defeated.
+  - Boss families can split into up to 6 cells, making them a team encounter rather than one oversized normal bot.
+- Added **mass transfer**. Press `W` or tap `TRANSFER` to donate roughly 8% of your current mass to your teammate (minimum 15, maximum 220 per transfer, with a short cooldown).
+- Removed the rare **+25 spiky pellets** completely. All map pellets are normal food again.
 - Team goal remains **5000**.
-- Maximum individual cell size remains **10,000** (radius 1000).
-- Rare spiky pellets still give exactly **+25 size**.
-- Hunter, Rival, Chaos, and Dumb bot personalities remain enabled.
-- Top-10 leaderboard, co-op partner arrow, player/bot splitting, and live player-size HUD remain included.
+- Maximum individual player cell size remains **10,000** (radius 1000).
+- Existing Hunter, Rival, Chaos, and Dumb bot personalities remain enabled.
+- Top-10 leaderboard, co-op partner arrow, player/bot splitting, host eating fix, and live player-size HUD remain included.
 
 ## Performance changes
 
-- Host bot AI runs at about **30 Hz** instead of every display frame; rendering remains smooth with `requestAnimationFrame`.
-- Bot and player Firebase movement writes are slightly less frequent to reduce network/serialization overhead.
-- Hot collision checks use squared-distance math instead of repeated square roots where possible.
-- Bot food lists are allocated once per AI tick instead of once per bot.
-- Host rendering/collision paths iterate the in-memory bot map directly instead of rebuilding objects every frame.
-- Large cells switch to a cheaper canvas detail level: expensive glow effects are disabled and line widths are capped.
-- Giant off-screen player cells are culled instead of being drawn unnecessarily.
-- Pellet and bot eating uses request back-pressure, preventing giant cells from launching hundreds of simultaneous Firebase transactions when they overlap a large cluster.
-- Bot pellet claims also have a global concurrency cap to prevent large enemy cells from flooding the database.
-- Bot eye detail is skipped for extremely large cells.
-- Surplus bot families from older rooms are automatically removed by the host, though creating a new room is still recommended.
+- Bot simulation now runs at ~25 Hz and bot network snapshots at a lower rate while rendering still uses `requestAnimationFrame`.
+- Canvas resolution is capped at **1.5× device pixel ratio** instead of 2×, reducing fill-rate cost on high-DPI screens.
+- Pellet collision and bot food-search logic now use a **spatial grid**, avoiding full scans of all pellets for most cells.
+- HUD/leaderboard DOM updates are throttled instead of rebuilding on every Realtime Database room snapshot.
+- The leaderboard no longer converts the host bot Map into a temporary object every update.
+- Existing giant-cell LOD, collision squared-distance checks, off-screen culling, and Firebase claim back-pressure remain enabled.
 
 ## Controls
 
 - **Move:** mouse, pen, or finger
 - **Split:** `Space` or the on-screen `SPLIT` button
+- **Transfer mass:** `W` or the on-screen `TRANSFER` button
 
-Players can have up to four cells. Bots can also split into multiple cells and later merge.
+Mass transfer is delivered through a small Firebase transfer queue so neither player needs permission to directly edit the other player's database state.
 
 ## Firebase setup
 
@@ -43,9 +42,9 @@ You still need to:
 
 1. Enable **Authentication → Sign-in method → Anonymous**.
 2. Create/enable **Realtime Database**.
-3. Publish the included `database.rules.json`. This build changes the allowed X coordinate bound to **5000** while keeping the Y bound at **4000**.
+3. **Publish the included `database.rules.json`**. This build adds the secure `/transfers` queue required for mass transfer.
 4. Serve the files over HTTP/HTTPS rather than opening `index.html` as a `file://` URL.
-5. After replacing an older build, hard-refresh both browsers and create a new room.
+5. Hard-refresh both browsers and create a **new room** after upgrading from an older build.
 
 ## Run locally
 
@@ -65,4 +64,4 @@ firebase deploy --only database,hosting
 
 ## Synchronization
 
-The room host is authoritative for enemy movement, bot splitting, bot-vs-bot eating, respawns, and pellet maintenance. Each player remains authoritative for their own movement. Host bot eating is now handled directly by the authoritative host simulation to avoid self-conflicting Firebase transactions.
+The room host is authoritative for regular bots, bosses, bot splitting/merging, bot-vs-bot eating, boss respawns, and pellet maintenance. Each player remains authoritative for their own movement and cell state. Mass transfers are created by the sender and atomically claimed/deleted by the intended recipient.

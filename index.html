@@ -37,7 +37,7 @@
       <p id="menuStatus" class="status" role="status"></p>
       <details>
         <summary>Controls</summary>
-        <p>Move with your mouse or finger. Press <strong>Space</strong> or tap <strong>SPLIT</strong> to split toward your aim. Eat pellets and smaller enemy cells, flee from larger bots, and grow together to reach 5000 team mass. Rare spiky pellets are worth +25 size. The arena is 5000×4000.</p>
+        <p>Move with your mouse or finger. Press <strong>Space</strong> or tap <strong>SPLIT</strong> to split toward your aim. Press <strong>W</strong> or tap <strong>TRANSFER</strong> to donate mass directly to your co-op partner. Eat pellets and smaller enemies, work together against roaming co-op bosses, and reach 5000 team mass. The arena is 5000×4000.</p>
       </details>
     </section>
   </main>
@@ -59,7 +59,7 @@
     </div>
     <div class="hud-card enemies-card">
       <span class="hud-label">ENEMIES</span>
-      <strong><span id="botsCount">20</span> BOTS</strong>
+      <strong><span id="botsCount">30</span> BOTS · <span id="bossesCount">2</span> BOSSES</strong>
     </div>
   </section>
 
@@ -70,7 +70,10 @@
 
   <div id="banner" class="banner hidden"></div>
 
-  <button id="splitBtn" class="split hidden" aria-label="Split your cells">SPLIT <span>SPACE</span></button>
+  <div class="action-buttons">
+    <button id="transferBtn" class="transfer hidden" aria-label="Transfer mass to your co-op partner">TRANSFER <span>W</span></button>
+    <button id="splitBtn" class="split hidden" aria-label="Split your cells">SPLIT <span>SPACE</span></button>
+  </div>
 
   <button id="leaveBtn" class="leave hidden">Leave room</button>
 
