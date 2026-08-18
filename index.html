@@ -36,7 +36,7 @@
       <p id="menuStatus" class="status" role="status"></p>
       <details>
         <summary>Controls</summary>
-        <p>Move your mouse or finger. Eat pellets and smaller enemy bots, flee from larger bots, and grow together to reach the team goal.</p>
+        <p>Move with your mouse or finger. Press <strong>Space</strong> or tap <strong>SPLIT</strong> to split toward your aim. Eat pellets and smaller enemy cells, flee from larger bots, and grow together to reach 600 team mass.</p>
       </details>
     </section>
   </main>
@@ -49,7 +49,7 @@
     </div>
     <div class="hud-card score-card">
       <span class="hud-label">TEAM MASS</span>
-      <strong><span id="score">0</span> / <span id="goal">120</span></strong>
+      <strong><span id="score">0</span> / <span id="goal">600</span></strong>
       <div class="progress"><i id="progressBar"></i></div>
     </div>
     <div class="hud-card players-card">
@@ -63,6 +63,8 @@
   </section>
 
   <div id="banner" class="banner hidden"></div>
+
+  <button id="splitBtn" class="split hidden" aria-label="Split your cells">SPLIT <span>SPACE</span></button>
 
   <button id="leaveBtn" class="leave hidden">Leave room</button>
 

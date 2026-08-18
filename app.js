@@ -1,4 +1,4 @@
-// Blob Buddies — 2-player Agar.io-inspired co-op demo with synchronized enemy bots
+// Blob Buddies — 2-player Agar.io-inspired co-op with synchronized splitting enemy bots.
 // Firebase Web SDK 12.17.1 via Google's CDN.
 
 import { initializeApp } from "https://www.gstatic.com/firebasejs/12.17.1/firebase-app.js";
@@ -16,8 +16,6 @@ import {
   serverTimestamp,
 } from "https://www.gstatic.com/firebasejs/12.17.1/firebase-database.js";
 
-// Firebase web app config for the testonlinerealtime project.
-// databaseURL is required for Realtime Database.
 const firebaseConfig = {
   apiKey: "AIzaSyDd555TxypX12AUjMWx_lmkeVFGgQDHJqw",
   authDomain: "testonlinerealtime.firebaseapp.com",
@@ -30,12 +28,24 @@ const firebaseConfig = {
 
 const WORLD = { width: 3000, height: 2000 };
 const FOOD_TARGET = 130;
-const TEAM_GOAL = 120;
+const TEAM_GOAL = 600;
 const START_RADIUS = 30;
-const BOT_COUNT = 8;
+
+const MAX_PLAYER_PIECES = 4;
+const PLAYER_SPLIT_MIN_RADIUS = 38;
+const PLAYER_SPLIT_BOOST = 650;
+const PLAYER_MERGE_MS = 6500;
+const PLAYER_SPLIT_COOLDOWN_MS = 350;
+
+const BOT_FAMILY_COUNT = 8;
 const BOT_EAT_RATIO = 1.14;
 const BOT_RESPAWN_MIN_RADIUS = 22;
 const BOT_RESPAWN_MAX_RADIUS = 43;
+const BOT_MAX_FAMILY_CELLS = 4;
+const BOT_SPLIT_MIN_RADIUS = 42;
+const BOT_SPLIT_BOOST = 590;
+const BOT_MERGE_MS = 7000;
+
 const COLORS = ["#72e7ff", "#a78bfa"];
 const FOOD_COLORS = ["#75f0ba", "#ffd166", "#ff7aa8", "#7bdff2", "#b8f2e6", "#cdb4ff"];
 const BOT_COLORS = ["#ff5f6d", "#ff8c42", "#ff477e", "#ef476f", "#f78c6b", "#ff6b6b", "#f25f5c", "#e85d75"];
@@ -46,6 +56,7 @@ const ctx = canvas.getContext("2d");
 const menu = document.querySelector("#menu");
 const hud = document.querySelector("#hud");
 const leaveBtn = document.querySelector("#leaveBtn");
+const splitBtn = document.querySelector("#splitBtn");
 const createBtn = document.querySelector("#createBtn");
 const joinBtn = document.querySelector("#joinBtn");
 const copyBtn = document.querySelector("#copyBtn");
@@ -79,15 +90,16 @@ let lastBotNetworkWrite = 0;
 let eating = new Set();
 let botEating = new Set();
 let botClaiming = new Set();
-let botRespawning = new Set();
+let botRemoving = new Set();
 let won = false;
 let invulnerableUntil = 0;
 let deathNoticeUntil = 0;
 let deathNotice = "";
 let previousPlayerCount = 0;
+let lastPlayerSplitAt = 0;
 
 const pointer = { x: innerWidth / 2, y: innerHeight / 2, active: true };
-const renderPlayers = new Map();
+const renderPlayerPieces = new Map();
 const renderBots = new Map();
 const hostBots = new Map();
 
@@ -112,16 +124,23 @@ function cleanName(name) {
   return (name || "").trim().replace(/[<>]/g, "").slice(0, 18) || randomName();
 }
 
+function makePiece(x, y, radius, mergeAt = 0, vx = 0, vy = 0) {
+  return { x, y, radius, vx, vy, mergeAt };
+}
+
 function makePlayer(slot = 0) {
+  const x = WORLD.width / 2 + (slot ? 90 : -90);
+  const y = WORLD.height / 2;
   return {
     uid,
     name: cleanName(nameInput.value),
-    x: WORLD.width / 2 + (slot ? 90 : -90),
-    y: WORLD.height / 2,
+    x,
+    y,
     radius: START_RADIUS,
     color: COLORS[slot % COLORS.length],
     joinedAt: Date.now(),
     lastSeen: Date.now(),
+    pieces: { p0: makePiece(x, y, START_RADIUS) },
   };
 }
 
@@ -142,7 +161,9 @@ function makeFood(count = FOOD_TARGET) {
 function makeBot(index = 0, id = `bot${index}`) {
   const angle = Math.random() * Math.PI * 2;
   const radius = BOT_RESPAWN_MIN_RADIUS + Math.random() * (BOT_RESPAWN_MAX_RADIUS - BOT_RESPAWN_MIN_RADIUS);
+  const now = Date.now();
   return {
+    family: `bot${index}`,
     name: BOT_NAMES[index % BOT_NAMES.length],
     x: 100 + Math.random() * (WORLD.width - 200),
     y: 100 + Math.random() * (WORLD.height - 200),
@@ -150,25 +171,78 @@ function makeBot(index = 0, id = `bot${index}`) {
     color: BOT_COLORS[index % BOT_COLORS.length],
     vx: Math.cos(angle),
     vy: Math.sin(angle),
-    turnAt: Date.now() + 1000 + Math.floor(Math.random() * 2600),
+    boostX: 0,
+    boostY: 0,
+    turnAt: now + 1000 + Math.floor(Math.random() * 2600),
+    mergeAt: 0,
+    splitReadyAt: now + 1800 + Math.floor(Math.random() * 2800),
   };
 }
 
-function makeBots(count = BOT_COUNT) {
+function makeBots(count = BOT_FAMILY_COUNT) {
   const bots = {};
   for (let i = 0; i < count; i++) bots[`bot${i}`] = makeBot(i, `bot${i}`);
   return bots;
 }
 
-function botIndex(botId) {
-  const n = Number(String(botId).replace(/\D/g, ""));
+function botIndexFromFamily(family) {
+  const n = Number(String(family || "bot0").replace(/\D/g, ""));
   return Number.isFinite(n) ? n : 0;
 }
 
-async function ensureFirebase() {
-  if (!firebaseConfigured()) {
-    throw new Error("Firebase is not configured yet. Paste your Firebase web config into app.js first.");
+function piecesOf(player) {
+  if (player?.pieces && Object.keys(player.pieces).length) return player.pieces;
+  if (!player) return {};
+  return { p0: makePiece(player.x, player.y, player.radius) };
+}
+
+function aggregatePieces(pieces) {
+  const values = Object.values(pieces || {}).filter(Boolean);
+  if (!values.length) return { x: WORLD.width / 2, y: WORLD.height / 2, radius: START_RADIUS, area: START_RADIUS ** 2 };
+  let area = 0;
+  let wx = 0;
+  let wy = 0;
+  for (const p of values) {
+    const a = Math.max(1, p.radius ** 2);
+    area += a;
+    wx += p.x * a;
+    wy += p.y * a;
   }
+  return { x: wx / area, y: wy / area, radius: Math.sqrt(area), area };
+}
+
+function syncLocalAggregate() {
+  if (!local) return;
+  const aggregate = aggregatePieces(local.pieces);
+  local.x = aggregate.x;
+  local.y = aggregate.y;
+  local.radius = Math.min(400, aggregate.radius);
+}
+
+function publicPlayerPayload() {
+  syncLocalAggregate();
+  const pieces = {};
+  for (const [id, p] of Object.entries(local.pieces || {})) {
+    pieces[id] = {
+      x: Math.round(p.x * 10) / 10,
+      y: Math.round(p.y * 10) / 10,
+      radius: Math.round(p.radius * 100) / 100,
+      vx: Math.round((p.vx || 0) * 100) / 100,
+      vy: Math.round((p.vy || 0) * 100) / 100,
+      mergeAt: Math.round(p.mergeAt || 0),
+    };
+  }
+  return {
+    x: Math.round(local.x * 10) / 10,
+    y: Math.round(local.y * 10) / 10,
+    radius: Math.round(local.radius * 100) / 100,
+    pieces,
+    lastSeen: Date.now(),
+  };
+}
+
+async function ensureFirebase() {
+  if (!firebaseConfigured()) throw new Error("Firebase is not configured yet. Paste your Firebase web config into app.js first.");
   if (uid) return;
   app = initializeApp(firebaseConfig);
   auth = getAuth(app);
@@ -199,12 +273,7 @@ async function createRoom() {
 
     const player = makePlayer(0);
     await set(ref(db, `rooms/${candidate}`), {
-      meta: {
-        hostUid: uid,
-        createdAt: serverTimestamp(),
-        goal: TEAM_GOAL,
-        world: WORLD,
-      },
+      meta: { hostUid: uid, createdAt: serverTimestamp(), goal: TEAM_GOAL, world: WORLD },
       players: { 0: player },
       food: makeFood(),
       bots: makeBots(),
@@ -254,6 +323,7 @@ async function joinRoom() {
     }
 
     if (claimedSlot === null || !player) throw new Error("That room already has two players.");
+    if (!player.pieces) player.pieces = { p0: makePiece(player.x, player.y, player.radius) };
     await enterRoom(code, player, claimedSlot);
   } catch (err) {
     console.error(err);
@@ -263,17 +333,19 @@ async function joinRoom() {
 
 async function enterRoom(code, player, slot) {
   roomId = code;
-  local = { ...player };
+  local = { ...player, pieces: structuredClone(piecesOf(player)) };
+  syncLocalAggregate();
   localSlot = slot;
   won = false;
   previousPlayerCount = 0;
-  renderPlayers.clear();
+  renderPlayerPieces.clear();
   renderBots.clear();
   hostBots.clear();
   roomCodeEl.textContent = code;
   menu.classList.add("hidden");
   hud.classList.remove("hidden");
   leaveBtn.classList.remove("hidden");
+  splitBtn?.classList.remove("hidden");
   setBusy(false, "");
 
   const playerRef = ref(db, `rooms/${roomId}/players/${localSlot}`);
@@ -291,20 +363,15 @@ async function enterRoom(code, player, slot) {
     const players = roomState.players || {};
     const meta = roomState.meta || {};
     const playerValues = Object.values(players);
-    if (playerValues.length >= 2 && previousPlayerCount < 2) {
-      invulnerableUntil = Math.max(invulnerableUntil, performance.now() + 2400);
-    }
+    if (playerValues.length >= 2 && previousPlayerCount < 2) invulnerableUntil = Math.max(invulnerableUntil, performance.now() + 2400);
     previousPlayerCount = playerValues.length;
+
     const selfPresent = playerValues.some((p) => p?.uid === uid);
     const hostPresent = playerValues.some((p) => p?.uid === meta.hostUid);
     const wasHost = localHost;
     localHost = meta.hostUid === uid;
-    if (localHost !== wasHost) {
-      hostBots.clear();
-      botRespawning.clear();
-    }
+    if (localHost !== wasHost) hostBots.clear();
 
-    // If the host disappeared, a remaining player can claim host duties.
     if ((!meta.hostUid || !hostPresent) && selfPresent) {
       runTransaction(ref(db, `rooms/${roomId}/meta/hostUid`), (current) => {
         const currentPresent = playerValues.some((p) => p?.uid === current);
@@ -323,9 +390,7 @@ async function enterRoom(code, player, slot) {
   });
 
   connectedUnsubscribe = onValue(ref(db, ".info/connected"), (snap) => {
-    if (snap.val() === true && roomId) {
-      onDisconnect(ref(db, `rooms/${roomId}/players/${localSlot}`)).remove().catch(console.warn);
-    }
+    if (snap.val() === true && roomId) onDisconnect(ref(db, `rooms/${roomId}/players/${localSlot}`)).remove().catch(console.warn);
   });
 }
 
@@ -342,7 +407,6 @@ async function leaveRoom(removeSelf = true) {
     try { await remove(ref(db, `rooms/${oldRoom}/players/${localSlot}`)); } catch (e) { console.warn(e); }
   }
 
-  // Clean up an empty room. If another player remains, host election handles it.
   if (db && oldRoom && wasHost) {
     try {
       const playersSnap = await get(ref(db, `rooms/${oldRoom}/players`));
@@ -355,13 +419,13 @@ async function leaveRoom(removeSelf = true) {
   local = null;
   localSlot = null;
   localHost = false;
-  renderPlayers.clear();
+  renderPlayerPieces.clear();
   renderBots.clear();
   hostBots.clear();
   eating.clear();
   botEating.clear();
   botClaiming.clear();
-  botRespawning.clear();
+  botRemoving.clear();
   won = false;
   invulnerableUntil = 0;
   deathNoticeUntil = 0;
@@ -369,49 +433,53 @@ async function leaveRoom(removeSelf = true) {
   hideBanner();
   hud.classList.add("hidden");
   leaveBtn.classList.add("hidden");
+  splitBtn?.classList.add("hidden");
   menu.classList.remove("hidden");
 }
 
 function friendlyError(err) {
   const msg = err?.message || String(err);
   if (msg.includes("auth/operation-not-allowed")) return "Enable Anonymous sign-in in Firebase Authentication.";
-  if (msg.includes("PERMISSION_DENIED")) return "Firebase rules denied access. Deploy database.rules.json.";
+  if (msg.includes("PERMISSION_DENIED")) return "Firebase rules denied access. Deploy the updated database.rules.json.";
   if (msg.includes("Failed to fetch") || msg.includes("network")) return "Network connection failed.";
   return msg;
 }
 
+function playerMass(player) {
+  return Math.round(aggregatePieces(piecesOf(player)).area / 100);
+}
+
 function teamMass(players) {
-  return Object.values(players).reduce((sum, p) => sum + Math.round((p.radius * p.radius) / 100), 0);
+  return Object.values(players).reduce((sum, p) => sum + playerMass(p), 0);
 }
 
 function updateHud(players, bots = {}) {
   const mass = teamMass(players);
-  if (botsCountEl) botsCountEl.textContent = String(Object.values(bots).filter((b) => b && !b.eatenBy).length);
+  const liveFamilies = new Set(Object.values(bots).filter((b) => b && !b.eatenBy).map((b) => b.family || "bot0"));
+  if (botsCountEl) botsCountEl.textContent = String(liveFamilies.size);
   scoreEl.textContent = String(mass);
   progressBar.style.width = `${Math.min(100, (mass / TEAM_GOAL) * 100)}%`;
 
   playersList.textContent = "";
-  Object.entries(players).forEach(([id, p]) => {
+  Object.entries(players).forEach(([, p]) => {
     const line = document.createElement("div");
     line.className = "player-line";
     const dot = document.createElement("span");
     dot.className = "dot";
     dot.style.background = p.color || "#fff";
     const text = document.createElement("span");
-    text.textContent = `${p.name || "Buddy"}${p.uid === uid ? " (you)" : ""}`;
+    const cells = Object.keys(piecesOf(p)).length;
+    text.textContent = `${p.name || "Buddy"}${p.uid === uid ? " (you)" : ""} · ${cells} cell${cells === 1 ? "" : "s"}`;
     line.append(dot, text);
     playersList.append(line);
   });
 
   const count = Object.keys(players).length;
-  if (count < 2) {
-    showBanner(`Waiting for your buddy…\nRoom ${roomId}`);
-  } else if (mass >= TEAM_GOAL) {
+  if (count < 2) showBanner(`Waiting for your buddy…\nRoom ${roomId}`);
+  else if (mass >= TEAM_GOAL) {
     won = true;
     showBanner("Team goal reached! 🎉\nKeep eating or start a new room.");
-  } else if (!won) {
-    hideBanner();
-  }
+  } else if (!won) hideBanner();
 }
 
 function showBanner(text) {
@@ -420,9 +488,7 @@ function showBanner(text) {
   banner.classList.remove("hidden");
 }
 
-function hideBanner() {
-  banner.classList.add("hidden");
-}
+function hideBanner() { banner.classList.add("hidden"); }
 
 function resizeCanvas() {
   const dpr = Math.min(devicePixelRatio || 1, 2);
@@ -444,48 +510,161 @@ canvas.addEventListener("pointerdown", (e) => {
   movePointer(e.clientX, e.clientY);
 });
 
+function currentAim() {
+  let dx = pointer.x - innerWidth / 2;
+  let dy = pointer.y - innerHeight / 2;
+  let dist = Math.hypot(dx, dy);
+  if (dist < 4) { dx = 1; dy = 0; dist = 1; }
+  return { x: dx / dist, y: dy / dist, intensity: Math.min(dist / 180, 1) };
+}
+
+function splitLocalPlayer() {
+  if (!roomId || !local || Object.keys(roomState?.players || {}).length < 2) return;
+  const now = Date.now();
+  if (now - lastPlayerSplitAt < PLAYER_SPLIT_COOLDOWN_MS) return;
+  const entries = Object.entries(local.pieces || {}).sort((a, b) => b[1].radius - a[1].radius);
+  if (entries.length >= MAX_PLAYER_PIECES) return;
+
+  const aim = currentAim();
+  let count = entries.length;
+  let changed = false;
+  for (const [id, piece] of entries) {
+    if (count >= MAX_PLAYER_PIECES) break;
+    if (piece.radius < PLAYER_SPLIT_MIN_RADIUS) continue;
+
+    const r = piece.radius / Math.sqrt(2);
+    piece.radius = r;
+    piece.mergeAt = now + PLAYER_MERGE_MS;
+    piece.vx = (piece.vx || 0) - aim.x * 75;
+    piece.vy = (piece.vy || 0) - aim.y * 75;
+
+    const newId = `p${now.toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+    local.pieces[newId] = makePiece(
+      Math.max(r, Math.min(WORLD.width - r, piece.x + aim.x * r * 1.35)),
+      Math.max(r, Math.min(WORLD.height - r, piece.y + aim.y * r * 1.35)),
+      r,
+      now + PLAYER_MERGE_MS,
+      aim.x * PLAYER_SPLIT_BOOST,
+      aim.y * PLAYER_SPLIT_BOOST,
+    );
+    count++;
+    changed = true;
+  }
+
+  if (changed) {
+    lastPlayerSplitAt = now;
+    syncLocalAggregate();
+    writeLocalNow();
+  }
+}
+
+function resolvePlayerPieceInteractions(dt) {
+  if (!local?.pieces) return;
+  const ids = Object.keys(local.pieces);
+  const now = Date.now();
+
+  for (let i = 0; i < ids.length; i++) {
+    const a = local.pieces[ids[i]];
+    if (!a) continue;
+    for (let j = i + 1; j < ids.length; j++) {
+      const b = local.pieces[ids[j]];
+      if (!b) continue;
+      let dx = b.x - a.x;
+      let dy = b.y - a.y;
+      let d = Math.hypot(dx, dy) || 0.001;
+      const mergeReady = now >= (a.mergeAt || 0) && now >= (b.mergeAt || 0);
+
+      if (mergeReady && d < (a.radius + b.radius) * 0.58) {
+        const areaA = a.radius ** 2;
+        const areaB = b.radius ** 2;
+        const total = areaA + areaB;
+        a.x = (a.x * areaA + b.x * areaB) / total;
+        a.y = (a.y * areaA + b.y * areaB) / total;
+        a.radius = Math.sqrt(total);
+        a.vx = ((a.vx || 0) * areaA + (b.vx || 0) * areaB) / total;
+        a.vy = ((a.vy || 0) * areaA + (b.vy || 0) * areaB) / total;
+        a.mergeAt = 0;
+        delete local.pieces[ids[j]];
+        continue;
+      }
+
+      if (!mergeReady) {
+        const desired = (a.radius + b.radius) * 0.82;
+        if (d < desired) {
+          const push = (desired - d) * 2.2 * dt;
+          dx /= d; dy /= d;
+          a.x -= dx * push;
+          a.y -= dy * push;
+          b.x += dx * push;
+          b.y += dy * push;
+        }
+      } else {
+        // Once merging is allowed, gently pull sibling cells together.
+        const pull = Math.min(42 * dt, d * 0.04);
+        dx /= d; dy /= d;
+        a.x += dx * pull;
+        a.y += dy * pull;
+        b.x -= dx * pull;
+        b.y -= dy * pull;
+      }
+    }
+  }
+}
+
 function tickMovement(dt) {
   if (!roomId || !roomState || !local) return;
   const players = roomState.players || {};
   if (Object.keys(players).length < 2) return;
 
-  const dx = pointer.x - innerWidth / 2;
-  const dy = pointer.y - innerHeight / 2;
-  const dist = Math.hypot(dx, dy);
-  if (dist > 6) {
-    const normalized = Math.min(dist / 180, 1);
-    const speed = Math.max(90, 265 - local.radius * 2.25) * normalized;
-    local.x += (dx / dist) * speed * dt;
-    local.y += (dy / dist) * speed * dt;
-    local.x = Math.max(local.radius, Math.min(WORLD.width - local.radius, local.x));
-    local.y = Math.max(local.radius, Math.min(WORLD.height - local.radius, local.y));
+  const aim = currentAim();
+  for (const piece of Object.values(local.pieces || {})) {
+    const speed = Math.max(90, 285 - piece.radius * 2.15) * aim.intensity;
+    piece.x += aim.x * speed * dt + (piece.vx || 0) * dt;
+    piece.y += aim.y * speed * dt + (piece.vy || 0) * dt;
+
+    const drag = Math.pow(0.025, dt);
+    piece.vx = (piece.vx || 0) * drag;
+    piece.vy = (piece.vy || 0) * drag;
+    if (Math.abs(piece.vx) < 0.4) piece.vx = 0;
+    if (Math.abs(piece.vy) < 0.4) piece.vy = 0;
+
+    piece.x = Math.max(piece.radius, Math.min(WORLD.width - piece.radius, piece.x));
+    piece.y = Math.max(piece.radius, Math.min(WORLD.height - piece.radius, piece.y));
   }
+
+  resolvePlayerPieceInteractions(dt);
+  syncLocalAggregate();
 
   const now = performance.now();
   if (now - lastNetworkWrite > 55) {
     lastNetworkWrite = now;
-    update(ref(db, `rooms/${roomId}/players/${localSlot}`), {
-      x: Math.round(local.x * 10) / 10,
-      y: Math.round(local.y * 10) / 10,
-      radius: Math.round(local.radius * 100) / 100,
-      lastSeen: Date.now(),
-    }).catch(console.warn);
+    update(ref(db, `rooms/${roomId}/players/${localSlot}`), publicPlayerPayload()).catch(console.warn);
   }
 
   checkFoodCollisions();
   checkBotCollisions();
 }
 
+function writeLocalNow() {
+  if (!db || !roomId || !local || localSlot === null) return;
+  update(ref(db, `rooms/${roomId}/players/${localSlot}`), publicPlayerPayload()).catch(console.warn);
+}
+
 function checkFoodCollisions() {
   const food = roomState?.food || {};
   for (const [foodId, f] of Object.entries(food)) {
     if (f.claimedBy || eating.has(foodId)) continue;
-    const dist = Math.hypot(local.x - f.x, local.y - f.y);
-    if (dist < local.radius + f.r * 0.6) claimFood(foodId, f);
+    for (const [pieceId, piece] of Object.entries(local.pieces || {})) {
+      const dist = Math.hypot(piece.x - f.x, piece.y - f.y);
+      if (dist < piece.radius + f.r * 0.6) {
+        claimFood(foodId, f, pieceId);
+        break;
+      }
+    }
   }
 }
 
-async function claimFood(foodId, food) {
+async function claimFood(foodId, food, pieceId) {
   if (!roomId || eating.has(foodId)) return;
   eating.add(foodId);
   const foodRef = ref(db, `rooms/${roomId}/food/${foodId}`);
@@ -496,8 +675,9 @@ async function claimFood(foodId, food) {
     }, { applyLocally: false });
 
     if (result.committed && result.snapshot.val()?.claimedBy === uid) {
-      const gainedArea = (food.r || 7) ** 2 * 0.82;
-      local.radius = Math.sqrt(local.radius ** 2 + gainedArea);
+      const piece = local?.pieces?.[pieceId];
+      if (piece) piece.radius = Math.sqrt(piece.radius ** 2 + (food.r || 7) ** 2 * 0.82);
+      syncLocalAggregate();
       await remove(foodRef);
     }
   } catch (err) {
@@ -509,23 +689,28 @@ async function claimFood(foodId, food) {
 
 function checkBotCollisions() {
   if (!local || !roomState?.bots || performance.now() < invulnerableUntil) return;
+  const pieceEntries = Object.entries(local.pieces || {});
+
   for (const [botId, bot] of Object.entries(roomState.bots)) {
     if (!bot || bot.eatenBy || botClaiming.has(botId)) continue;
-    const dist = Math.hypot(local.x - bot.x, local.y - bot.y);
+    for (const [pieceId, piece] of pieceEntries) {
+      if (!local.pieces?.[pieceId]) continue;
+      const dist = Math.hypot(piece.x - bot.x, piece.y - bot.y);
 
-    if (local.radius > bot.radius * BOT_EAT_RATIO && dist < local.radius - bot.radius * 0.12) {
-      claimBot(botId, bot);
-      continue;
-    }
+      if (piece.radius > bot.radius * BOT_EAT_RATIO && dist < piece.radius - bot.radius * 0.12) {
+        claimBot(botId, bot, pieceId);
+        break;
+      }
 
-    if (bot.radius > local.radius * BOT_EAT_RATIO && dist < bot.radius - local.radius * 0.12) {
-      eatenByBot(bot);
-      break;
+      if (bot.radius > piece.radius * BOT_EAT_RATIO && dist < bot.radius - piece.radius * 0.12) {
+        eatenByBot(pieceId, bot);
+        break;
+      }
     }
   }
 }
 
-async function claimBot(botId, bot) {
+async function claimBot(botId, bot, pieceId) {
   if (!roomId || !local || botClaiming.has(botId)) return;
   botClaiming.add(botId);
   const botRef = ref(db, `rooms/${roomId}/bots/${botId}`);
@@ -536,8 +721,9 @@ async function claimBot(botId, bot) {
     }, { applyLocally: false });
 
     if (result.committed && result.snapshot.val()?.eatenBy === uid) {
-      const gainedArea = (bot.radius || 28) ** 2 * 0.72;
-      local.radius = Math.min(400, Math.sqrt(local.radius ** 2 + gainedArea));
+      const piece = local?.pieces?.[pieceId];
+      if (piece) piece.radius = Math.min(400, Math.sqrt(piece.radius ** 2 + (bot.radius || 28) ** 2 * 0.72));
+      syncLocalAggregate();
     }
   } catch (err) {
     console.warn("Bot claim failed", err);
@@ -546,22 +732,34 @@ async function claimBot(botId, bot) {
   }
 }
 
-function eatenByBot(bot) {
+function eatenByBot(pieceId, bot) {
   const now = performance.now();
-  if (!local || now < invulnerableUntil) return;
-  local.radius = START_RADIUS;
-  local.x = Math.max(80, Math.min(WORLD.width - 80, WORLD.width / 2 + (localSlot ? 180 : -180) + (Math.random() - 0.5) * 280));
-  local.y = Math.max(80, Math.min(WORLD.height - 80, WORLD.height / 2 + (Math.random() - 0.5) * 280));
-  invulnerableUntil = now + 2400;
-  deathNotice = `${bot.name || "Enemy"} ate you! Respawn shield active.`;
-  deathNoticeUntil = now + 1800;
+  if (!local?.pieces?.[pieceId] || now < invulnerableUntil) return;
+  const lost = local.pieces[pieceId];
+  delete local.pieces[pieceId];
 
-  update(ref(db, `rooms/${roomId}/players/${localSlot}`), {
-    x: Math.round(local.x * 10) / 10,
-    y: Math.round(local.y * 10) / 10,
-    radius: local.radius,
-    lastSeen: Date.now(),
-  }).catch(console.warn);
+  if (!Object.keys(local.pieces).length) {
+    const x = Math.max(80, Math.min(WORLD.width - 80, WORLD.width / 2 + (localSlot ? 180 : -180) + (Math.random() - 0.5) * 280));
+    const y = Math.max(80, Math.min(WORLD.height - 80, WORLD.height / 2 + (Math.random() - 0.5) * 280));
+    local.pieces = { p0: makePiece(x, y, START_RADIUS) };
+    deathNotice = `${bot.name || "Enemy"} ate you! Respawn shield active.`;
+  } else {
+    deathNotice = `${bot.name || "Enemy"} ate one of your split cells!`;
+  }
+
+  // Keep the remaining cells from immediately collapsing into the collision point.
+  for (const piece of Object.values(local.pieces)) {
+    const dx = piece.x - (lost?.x || piece.x);
+    const dy = piece.y - (lost?.y || piece.y);
+    const d = Math.hypot(dx, dy) || 1;
+    piece.vx += (dx / d) * 80;
+    piece.vy += (dy / d) * 80;
+  }
+
+  invulnerableUntil = now + 1900;
+  deathNoticeUntil = now + 1800;
+  syncLocalAggregate();
+  writeLocalNow();
 }
 
 async function botClaimFood(botId, foodId, food) {
@@ -588,38 +786,157 @@ async function botClaimFood(botId, foodId, food) {
   }
 }
 
-function resetBot(botId) {
-  if (!roomId || botRespawning.has(botId)) return;
-  botRespawning.add(botId);
-  const fresh = makeBot(botIndex(botId), botId);
-  hostBots.set(botId, { ...fresh });
-  set(ref(db, `rooms/${roomId}/bots/${botId}`), fresh)
+function deleteBotCell(botId) {
+  if (!roomId || botRemoving.has(botId)) return;
+  botRemoving.add(botId);
+  hostBots.delete(botId);
+  remove(ref(db, `rooms/${roomId}/bots/${botId}`))
     .catch(console.warn)
-    .finally(() => botRespawning.delete(botId));
+    .finally(() => botRemoving.delete(botId));
+}
+
+function familyCells(family) {
+  return [...hostBots.entries()].filter(([, b]) => b && !b.eatenBy && b.family === family);
+}
+
+function ensureBotFamilies() {
+  if (!localHost || !roomId) return;
+  for (let i = 0; i < BOT_FAMILY_COUNT; i++) {
+    const family = `bot${i}`;
+    if (familyCells(family).length) continue;
+    const fresh = makeBot(i, family);
+    hostBots.set(family, fresh);
+    set(ref(db, `rooms/${roomId}/bots/${family}`), fresh).catch(console.warn);
+  }
 }
 
 function ensureHostBots() {
   if (!localHost || !roomState) return;
   const remoteBots = roomState.bots || {};
 
-  if (Object.keys(remoteBots).length === 0 && hostBots.size === 0) {
-    const fresh = makeBots();
-    for (const [id, bot] of Object.entries(fresh)) hostBots.set(id, { ...bot });
-    update(ref(db, `rooms/${roomId}/bots`), fresh).catch(console.warn);
-    return;
-  }
-
   for (const [id, bot] of Object.entries(remoteBots)) {
     if (!bot) continue;
     if (bot.eatenBy) {
-      resetBot(id);
+      deleteBotCell(id);
       continue;
     }
     if (!hostBots.has(id)) hostBots.set(id, { ...bot });
   }
 
-  for (const id of [...hostBots.keys()]) {
-    if (!remoteBots[id] && !botRespawning.has(id)) hostBots.delete(id);
+  if (!hostBots.size && !Object.keys(remoteBots).length) {
+    const fresh = makeBots();
+    for (const [id, bot] of Object.entries(fresh)) hostBots.set(id, { ...bot });
+    update(ref(db, `rooms/${roomId}/bots`), fresh).catch(console.warn);
+  }
+
+  ensureBotFamilies();
+}
+
+function allPlayerTargets() {
+  const targets = [];
+  for (const p of Object.values(roomState?.players || {}).filter(Boolean)) {
+    const source = p.uid === uid && local ? local : p;
+    for (const [pieceId, piece] of Object.entries(piecesOf(source))) {
+      targets.push({ ...piece, ownerUid: p.uid, pieceId });
+    }
+  }
+  return targets;
+}
+
+function splitBot(botId, bot, aimX, aimY) {
+  const now = Date.now();
+  if (bot.radius < BOT_SPLIT_MIN_RADIUS || now < (bot.splitReadyAt || 0)) return false;
+  const family = bot.family || `bot${botIndexFromFamily(botId)}`;
+  if (familyCells(family).length >= BOT_MAX_FAMILY_CELLS) return false;
+
+  const mag = Math.hypot(aimX, aimY) || 1;
+  aimX /= mag; aimY /= mag;
+  const r = bot.radius / Math.sqrt(2);
+  bot.radius = r;
+  bot.mergeAt = now + BOT_MERGE_MS;
+  bot.splitReadyAt = now + 5200 + Math.floor(Math.random() * 1800);
+  bot.boostX = (bot.boostX || 0) - aimX * 55;
+  bot.boostY = (bot.boostY || 0) - aimY * 55;
+
+  const childId = `${family}_s_${now.toString(36)}_${Math.random().toString(36).slice(2, 5)}`;
+  const child = {
+    ...bot,
+    x: Math.max(r, Math.min(WORLD.width - r, bot.x + aimX * r * 1.3)),
+    y: Math.max(r, Math.min(WORLD.height - r, bot.y + aimY * r * 1.3)),
+    radius: r,
+    vx: aimX,
+    vy: aimY,
+    boostX: aimX * BOT_SPLIT_BOOST,
+    boostY: aimY * BOT_SPLIT_BOOST,
+    mergeAt: now + BOT_MERGE_MS,
+    splitReadyAt: bot.splitReadyAt,
+  };
+  hostBots.set(childId, child);
+
+  const patch = {};
+  patch[`bots/${botId}`] = bot;
+  patch[`bots/${childId}`] = child;
+  update(ref(db, `rooms/${roomId}`), patch).catch(console.warn);
+  return true;
+}
+
+function mergeBotCells(bigId, big, smallId, small) {
+  const areaA = big.radius ** 2;
+  const areaB = small.radius ** 2;
+  const total = areaA + areaB;
+  big.x = (big.x * areaA + small.x * areaB) / total;
+  big.y = (big.y * areaA + small.y * areaB) / total;
+  big.radius = Math.min(260, Math.sqrt(total));
+  big.boostX = 0;
+  big.boostY = 0;
+  big.mergeAt = 0;
+  big.splitReadyAt = Date.now() + 2200;
+  hostBots.set(bigId, big);
+  deleteBotCell(smallId);
+}
+
+function resolveBotFamilyInteractions(dt) {
+  const now = Date.now();
+  const groups = new Map();
+  for (const [id, bot] of hostBots) {
+    const family = bot.family || `bot${botIndexFromFamily(id)}`;
+    if (!groups.has(family)) groups.set(family, []);
+    groups.get(family).push([id, bot]);
+  }
+
+  for (const entries of groups.values()) {
+    for (let i = 0; i < entries.length; i++) {
+      const [idA, a] = entries[i];
+      if (!hostBots.has(idA)) continue;
+      for (let j = i + 1; j < entries.length; j++) {
+        const [idB, b] = entries[j];
+        if (!hostBots.has(idB)) continue;
+        let dx = b.x - a.x;
+        let dy = b.y - a.y;
+        let d = Math.hypot(dx, dy) || 0.001;
+        const mergeReady = now >= (a.mergeAt || 0) && now >= (b.mergeAt || 0);
+
+        if (mergeReady && d < (a.radius + b.radius) * 0.6) {
+          if (a.radius >= b.radius) mergeBotCells(idA, a, idB, b);
+          else mergeBotCells(idB, b, idA, a);
+          continue;
+        }
+
+        dx /= d; dy /= d;
+        if (!mergeReady) {
+          const desired = (a.radius + b.radius) * 0.8;
+          if (d < desired) {
+            const push = (desired - d) * 1.7 * dt;
+            a.x -= dx * push; a.y -= dy * push;
+            b.x += dx * push; b.y += dy * push;
+          }
+        } else {
+          const pull = Math.min(36 * dt, d * 0.035);
+          a.x += dx * pull; a.y += dy * pull;
+          b.x -= dx * pull; b.y -= dy * pull;
+        }
+      }
+    }
   }
 }
 
@@ -628,14 +945,12 @@ function tickBots(dt, now) {
   ensureHostBots();
   if (!hostBots.size) return;
 
-  const players = Object.values(roomState.players || {}).filter(Boolean);
+  const targets = allPlayerTargets();
   const food = roomState.food || {};
-  const botEntries = [...hostBots.entries()];
+  const entriesAtStart = [...hostBots.entries()];
 
-  for (const [botId, bot] of botEntries) {
-    if (botRespawning.has(botId)) continue;
-    const remote = roomState.bots?.[botId];
-    if (remote?.eatenBy) continue;
+  for (const [botId, bot] of entriesAtStart) {
+    if (!hostBots.has(botId) || botRemoving.has(botId)) continue;
 
     let dirX = bot.vx || 1;
     let dirY = bot.vy || 0;
@@ -644,7 +959,7 @@ function tickBots(dt, now) {
     let prey = null;
     let preyDist = Infinity;
 
-    for (const p of players) {
+    for (const p of targets) {
       const d = Math.hypot(p.x - bot.x, p.y - bot.y);
       if (p.radius > bot.radius * BOT_EAT_RATIO && d < 720 && d < threatDist) { threat = p; threatDist = d; }
       if (bot.radius > p.radius * BOT_EAT_RATIO && d < 880 && d < preyDist) { prey = p; preyDist = d; }
@@ -656,6 +971,11 @@ function tickBots(dt, now) {
     } else if (prey) {
       dirX = prey.x - bot.x;
       dirY = prey.y - bot.y;
+
+      // Aggressive bots use a split attack when they have enough mass and a clear target.
+      if (preyDist > bot.radius * 1.45 && preyDist < 430 && bot.radius > prey.radius * 1.46) {
+        splitBot(botId, bot, dirX, dirY);
+      }
     } else {
       let nearestFood = null;
       let nearestFoodDist = 560;
@@ -683,8 +1003,14 @@ function tickBots(dt, now) {
     bot.vy /= vmag;
 
     const speed = Math.max(72, 238 - bot.radius * 1.65) * (threat ? 1.16 : 1);
-    bot.x += bot.vx * speed * dt;
-    bot.y += bot.vy * speed * dt;
+    bot.x += bot.vx * speed * dt + (bot.boostX || 0) * dt;
+    bot.y += bot.vy * speed * dt + (bot.boostY || 0) * dt;
+    const boostDrag = Math.pow(0.03, dt);
+    bot.boostX = (bot.boostX || 0) * boostDrag;
+    bot.boostY = (bot.boostY || 0) * boostDrag;
+    if (Math.abs(bot.boostX) < 0.4) bot.boostX = 0;
+    if (Math.abs(bot.boostY) < 0.4) bot.boostY = 0;
+
     bot.x = Math.max(bot.radius, Math.min(WORLD.width - bot.radius, bot.x));
     bot.y = Math.max(bot.radius, Math.min(WORLD.height - bot.radius, bot.y));
 
@@ -697,36 +1023,49 @@ function tickBots(dt, now) {
     }
   }
 
-  // Bots can eat each other too, which creates a more Agar.io-like ecosystem.
+  resolveBotFamilyInteractions(dt);
+
+  // Different enemy families can eat each other's cells.
+  const botEntries = [...hostBots.entries()];
   for (let i = 0; i < botEntries.length; i++) {
     const [idA, a] = botEntries[i];
-    if (!a || botRespawning.has(idA) || roomState.bots?.[idA]?.eatenBy) continue;
+    if (!hostBots.has(idA)) continue;
     for (let j = i + 1; j < botEntries.length; j++) {
       const [idB, b] = botEntries[j];
-      if (!b || botRespawning.has(idB) || roomState.bots?.[idB]?.eatenBy) continue;
+      if (!hostBots.has(idB) || a.family === b.family) continue;
       const d = Math.hypot(a.x - b.x, a.y - b.y);
       let bigId, big, smallId, small;
-      if (a.radius > b.radius * BOT_EAT_RATIO) { [bigId, big, smallId, small] = [idA, a, idB, b]; }
-      else if (b.radius > a.radius * BOT_EAT_RATIO) { [bigId, big, smallId, small] = [idB, b, idA, a]; }
+      if (a.radius > b.radius * BOT_EAT_RATIO) [bigId, big, smallId, small] = [idA, a, idB, b];
+      else if (b.radius > a.radius * BOT_EAT_RATIO) [bigId, big, smallId, small] = [idB, b, idA, a];
       else continue;
       if (d < big.radius - small.radius * 0.12) {
         big.radius = Math.min(260, Math.sqrt(big.radius ** 2 + small.radius ** 2 * 0.64));
-        resetBot(smallId);
+        hostBots.set(bigId, big);
+        deleteBotCell(smallId);
       }
     }
   }
+
+  ensureBotFamilies();
 
   if (now - lastBotNetworkWrite > 110) {
     lastBotNetworkWrite = now;
     const patch = {};
     for (const [id, bot] of hostBots) {
-      if (botRespawning.has(id) || roomState.bots?.[id]?.eatenBy) continue;
+      if (botRemoving.has(id)) continue;
+      patch[`bots/${id}/family`] = bot.family;
+      patch[`bots/${id}/name`] = bot.name;
       patch[`bots/${id}/x`] = Math.round(bot.x * 10) / 10;
       patch[`bots/${id}/y`] = Math.round(bot.y * 10) / 10;
       patch[`bots/${id}/radius`] = Math.round(bot.radius * 100) / 100;
+      patch[`bots/${id}/color`] = bot.color;
       patch[`bots/${id}/vx`] = Math.round(bot.vx * 10000) / 10000;
       patch[`bots/${id}/vy`] = Math.round(bot.vy * 10000) / 10000;
-      patch[`bots/${id}/turnAt`] = bot.turnAt;
+      patch[`bots/${id}/boostX`] = Math.round((bot.boostX || 0) * 100) / 100;
+      patch[`bots/${id}/boostY`] = Math.round((bot.boostY || 0) * 100) / 100;
+      patch[`bots/${id}/turnAt`] = Math.round(bot.turnAt || 0);
+      patch[`bots/${id}/mergeAt`] = Math.round(bot.mergeAt || 0);
+      patch[`bots/${id}/splitReadyAt`] = Math.round(bot.splitReadyAt || 0);
     }
     if (Object.keys(patch).length) update(ref(db, `rooms/${roomId}`), patch).catch(console.warn);
   }
@@ -735,7 +1074,6 @@ function tickBots(dt, now) {
 function hostMaintenance(now) {
   if (!localHost || !roomId || !roomState || now - hostLoopAt < 1200) return;
   hostLoopAt = now;
-
   const food = roomState.food || {};
   const missing = FOOD_TARGET - Object.keys(food).length;
   if (missing > 0) {
@@ -785,30 +1123,36 @@ function drawFood(cam) {
   }
 }
 
-function smoothPlayers(dt) {
+function smoothPlayerPieces(dt) {
   const players = roomState?.players || {};
-  for (const [id, p] of Object.entries(players)) {
-    let rp = renderPlayers.get(id);
-    if (!rp) {
-      rp = { x: p.x, y: p.y, radius: p.radius };
-      renderPlayers.set(id, rp);
+  const active = new Set();
+  for (const [slot, p] of Object.entries(players)) {
+    const source = p.uid === uid && local ? local : p;
+    for (const [pieceId, piece] of Object.entries(piecesOf(source))) {
+      const key = `${slot}:${pieceId}`;
+      active.add(key);
+      let rp = renderPlayerPieces.get(key);
+      if (!rp) {
+        rp = { x: piece.x, y: piece.y, radius: piece.radius };
+        renderPlayerPieces.set(key, rp);
+      }
+      const t = 1 - Math.pow(0.001, dt);
+      rp.x += (piece.x - rp.x) * t;
+      rp.y += (piece.y - rp.y) * t;
+      rp.radius += (piece.radius - rp.radius) * t;
     }
-    const target = p.uid === uid && local ? local : p;
-    const t = 1 - Math.pow(0.001, dt);
-    rp.x += (target.x - rp.x) * t;
-    rp.y += (target.y - rp.y) * t;
-    rp.radius += (target.radius - rp.radius) * t;
   }
-  for (const id of renderPlayers.keys()) {
-    if (!players[id]) renderPlayers.delete(id);
-  }
+  for (const key of renderPlayerPieces.keys()) if (!active.has(key)) renderPlayerPieces.delete(key);
 }
 
 function smoothBots(dt) {
   const bots = roomState?.bots || {};
-  for (const [id, remote] of Object.entries(bots)) {
+  const active = new Set();
+  const sourceEntries = localHost ? [...hostBots.entries()] : Object.entries(bots);
+  for (const [id, remote] of sourceEntries) {
     if (!remote || remote.eatenBy) continue;
-    const target = localHost && hostBots.has(id) ? hostBots.get(id) : remote;
+    active.add(id);
+    const target = remote;
     let rb = renderBots.get(id);
     if (!rb) {
       rb = { x: target.x, y: target.y, radius: target.radius };
@@ -819,14 +1163,12 @@ function smoothBots(dt) {
     rb.y += (target.y - rb.y) * t;
     rb.radius += (target.radius - rb.radius) * t;
   }
-  for (const id of renderBots.keys()) {
-    if (!bots[id] || bots[id]?.eatenBy) renderBots.delete(id);
-  }
+  for (const id of renderBots.keys()) if (!active.has(id)) renderBots.delete(id);
 }
 
 function drawBots(cam) {
-  const bots = roomState?.bots || {};
-  for (const [id, bot] of Object.entries(bots)) {
+  const source = localHost ? Object.fromEntries(hostBots) : (roomState?.bots || {});
+  for (const [id, bot] of Object.entries(source)) {
     if (!bot || bot.eatenBy) continue;
     const rb = renderBots.get(id) || bot;
     const x = rb.x - cam.x;
@@ -860,7 +1202,7 @@ function drawBots(cam) {
       ctx.fill();
     }
 
-    const fontSize = Math.max(10, Math.min(18, r * 0.38));
+    const fontSize = Math.max(9, Math.min(18, r * 0.38));
     ctx.font = `900 ${fontSize}px Inter, system-ui, sans-serif`;
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
@@ -872,41 +1214,45 @@ function drawBots(cam) {
 
 function drawPlayers(cam) {
   const players = roomState?.players || {};
-  for (const [id, p] of Object.entries(players)) {
-    const rp = renderPlayers.get(id) || p;
-    const x = rp.x - cam.x;
-    const y = rp.y - cam.y;
-    const r = rp.radius;
+  for (const [slot, p] of Object.entries(players)) {
+    const source = p.uid === uid && local ? local : p;
+    const entries = Object.entries(piecesOf(source));
+    for (const [pieceId, piece] of entries) {
+      const rp = renderPlayerPieces.get(`${slot}:${pieceId}`) || piece;
+      const x = rp.x - cam.x;
+      const y = rp.y - cam.y;
+      const r = rp.radius;
 
-    ctx.save();
-    ctx.shadowColor = p.color || "#fff";
-    ctx.shadowBlur = p.uid === uid ? 22 : 12;
-    ctx.beginPath();
-    ctx.arc(x, y, r, 0, Math.PI * 2);
-    ctx.fillStyle = p.color || "#fff";
-    ctx.fill();
-    ctx.shadowBlur = 0;
-    ctx.lineWidth = Math.max(2, r * 0.07);
-    ctx.strokeStyle = "rgba(255,255,255,.6)";
-    ctx.stroke();
-
-    if (p.uid === uid && performance.now() < invulnerableUntil) {
+      ctx.save();
+      ctx.shadowColor = p.color || "#fff";
+      ctx.shadowBlur = p.uid === uid ? 22 : 12;
       ctx.beginPath();
-      ctx.arc(x, y, r + 8, 0, Math.PI * 2);
-      ctx.setLineDash([7, 6]);
-      ctx.lineWidth = 2;
-      ctx.strokeStyle = "rgba(255,255,255,.75)";
+      ctx.arc(x, y, r, 0, Math.PI * 2);
+      ctx.fillStyle = p.color || "#fff";
+      ctx.fill();
+      ctx.shadowBlur = 0;
+      ctx.lineWidth = Math.max(2, r * 0.07);
+      ctx.strokeStyle = "rgba(255,255,255,.6)";
       ctx.stroke();
-      ctx.setLineDash([]);
-    }
 
-    const fontSize = Math.max(12, Math.min(22, r * 0.48));
-    ctx.font = `800 ${fontSize}px Inter, system-ui, sans-serif`;
-    ctx.textAlign = "center";
-    ctx.textBaseline = "middle";
-    ctx.fillStyle = "rgba(8,12,25,.82)";
-    ctx.fillText(p.name || "Buddy", x, y);
-    ctx.restore();
+      if (p.uid === uid && performance.now() < invulnerableUntil) {
+        ctx.beginPath();
+        ctx.arc(x, y, r + 8, 0, Math.PI * 2);
+        ctx.setLineDash([7, 6]);
+        ctx.lineWidth = 2;
+        ctx.strokeStyle = "rgba(255,255,255,.75)";
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
+
+      const fontSize = Math.max(10, Math.min(22, r * 0.48));
+      ctx.font = `800 ${fontSize}px Inter, system-ui, sans-serif`;
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillStyle = "rgba(8,12,25,.82)";
+      ctx.fillText(p.name || "Buddy", x, y);
+      ctx.restore();
+    }
   }
 }
 
@@ -947,7 +1293,7 @@ function frame(now) {
   tickMovement(dt);
   tickBots(dt, now);
   hostMaintenance(now);
-  smoothPlayers(dt);
+  smoothPlayerPieces(dt);
   smoothBots(dt);
 
   const cam = getCamera();
@@ -963,6 +1309,7 @@ function frame(now) {
 createBtn.addEventListener("click", createRoom);
 joinBtn.addEventListener("click", joinRoom);
 leaveBtn.addEventListener("click", () => leaveRoom(true));
+splitBtn?.addEventListener("click", (e) => { e.preventDefault(); splitLocalPlayer(); });
 copyBtn.addEventListener("click", async () => {
   if (!roomId) return;
   try {
@@ -978,15 +1325,18 @@ roomInput.addEventListener("input", () => {
 });
 roomInput.addEventListener("keydown", (e) => { if (e.key === "Enter") joinRoom(); });
 nameInput.addEventListener("keydown", (e) => { if (e.key === "Enter") createRoom(); });
+window.addEventListener("keydown", (e) => {
+  if (e.code === "Space" && roomId) {
+    e.preventDefault();
+    if (!e.repeat) splitLocalPlayer();
+  }
+});
 window.addEventListener("resize", resizeCanvas);
 window.addEventListener("beforeunload", () => {
-  // onDisconnect is the reliable cleanup path; this is only a best-effort hint.
   if (db && roomId && uid && localSlot !== null) remove(ref(db, `rooms/${roomId}/players/${localSlot}`)).catch(() => {});
 });
 
 resizeCanvas();
 requestAnimationFrame(frame);
 
-if (!firebaseConfigured()) {
-  menuStatus.textContent = "Setup required: paste your Firebase config into app.js.";
-}
+if (!firebaseConfigured()) menuStatus.textContent = "Setup required: paste your Firebase config into app.js.";
