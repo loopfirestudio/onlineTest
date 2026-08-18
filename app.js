@@ -1,5 +1,5 @@
 // Blob Buddies — 2-player Agar.io-inspired co-op with synchronized bots, co-op bosses, splitting, and mass transfer.
-// Build 1.8.0 adds boss encounters, teammate mass transfer, removes rare +25 pellets, and improves performance.
+// Build 1.8.1 gates boss encounters behind 4000 combined team mass while keeping the 1.8 performance and transfer systems.
 // Firebase Web SDK 12.17.1 via Google's CDN.
 
 import { initializeApp } from "https://www.gstatic.com/firebasejs/12.17.1/firebase-app.js";
@@ -27,7 +27,7 @@ const firebaseConfig = {
   appId: "1:257019969127:web:0a910b0fe08fde4d60dec2",
 };
 
-const BUILD_VERSION = "1.8.0-bosses-transfer";
+const BUILD_VERSION = "1.8.1-boss-threshold";
 const WORLD = { width: 5000, height: 4000 };
 const FOOD_TARGET = 400;
 const TEAM_GOAL = 5000;
@@ -46,6 +46,7 @@ const BOSS_MIN_RADIUS = 790;
 const BOSS_MAX_RADIUS = 875;
 const BOSS_MAX_FAMILY_CELLS = 6;
 const BOSS_RESPAWN_MS = 9000;
+const BOSS_UNLOCK_TEAM_MASS = 4000;
 const BOT_EAT_RATIO = 1.10;
 const EAT_OVERLAP_FACTOR = 0.18;
 const BOT_RESPAWN_MIN_RADIUS = 22;
@@ -278,7 +279,10 @@ function makeBosses(count = BOSS_FAMILY_COUNT) {
 }
 
 function makeInitialEnemies() {
-  return { ...makeBots(), ...makeBosses() };
+  // Bosses are deliberately excluded from initial room creation. They unlock
+  // only after both co-op players are present and their combined mass reaches
+  // BOSS_UNLOCK_TEAM_MASS.
+  return makeBots();
 }
 
 function botIndexFromFamily(family) {
@@ -571,6 +575,18 @@ function playerMass(player) {
 
 function teamMass(players) {
   return Object.values(players).reduce((sum, p) => sum + playerMass(p), 0);
+}
+
+function currentTeamMassForBosses() {
+  const players = Object.values(roomState?.players || {}).filter(Boolean);
+  let mass = 0;
+  for (const p of players) {
+    const source = p.uid === uid && local
+      ? { ...p, pieces: local.pieces, x: local.x, y: local.y, radius: local.radius }
+      : p;
+    mass += playerMass(source);
+  }
+  return { mass, playerCount: players.length };
 }
 
 function growRadiusFromFood(radius, food, normalFactor = 0.82) {
@@ -1220,6 +1236,21 @@ function ensureBotFamilies() {
 
 function ensureBossFamilies() {
   if (!localHost || !roomId) return;
+
+  const { mass: combinedMass, playerCount } = currentTeamMassForBosses();
+  const bossesUnlocked = playerCount >= 2 && combinedMass >= BOSS_UNLOCK_TEAM_MASS;
+
+  // Existing boss fights are allowed to finish if the team later drops below
+  // the threshold. However, no new boss family is spawned or respawned until
+  // both players are connected and the team is back at 4000+ combined mass.
+  if (!bossesUnlocked) {
+    for (let i = 0; i < BOSS_FAMILY_COUNT; i++) {
+      const family = `boss${i}`;
+      if (!familyCells(family).length) botRespawnAt.delete(family);
+    }
+    return;
+  }
+
   const now = Date.now();
   for (let i = 0; i < BOSS_FAMILY_COUNT; i++) {
     const family = `boss${i}`;

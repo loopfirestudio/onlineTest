@@ -1,12 +1,14 @@
-# Blob Buddies — Build 1.8.0 — Co-op Bosses + Mass Transfer
+# Blob Buddies — Build 1.8.1 — Boss Threshold
 
 A 2-player Agar.io-inspired browser co-op game synchronized with Firebase Realtime Database.
 
 ## What changed in this build
 
+- **Bosses are now locked until both players are connected and the team reaches 4000 combined mass.** Fresh rooms start with zero bosses. Once unlocked, a boss fight can finish even if team mass later drops below 4000; defeated bosses will not respawn until the team reaches 4000 again.
+
 - Arena remains **5000×4000**.
 - Enemy population remains **30 regular bot families**.
-- Added **2 co-op boss families**: Void Titan and Crimson Colossus.
+- Includes **2 co-op boss families**: Void Titan and Crimson Colossus.
   - Each boss initially spawns as multiple huge cells.
   - Bosses aggressively pressure the human team, can split-attack vulnerable players, grow by eating, merge again, and respawn after the whole boss family is defeated.
   - Boss families can split into up to 6 cells, making them a team encounter rather than one oversized normal bot.
@@ -65,3 +67,7 @@ firebase deploy --only database,hosting
 ## Synchronization
 
 The room host is authoritative for regular bots, bosses, bot splitting/merging, bot-vs-bot eating, boss respawns, and pellet maintenance. Each player remains authoritative for their own movement and cell state. Mass transfers are created by the sender and atomically claimed/deleted by the intended recipient.
+
+## Boss unlock rule
+
+Boss spawn/respawn condition: **2 connected players + at least 4000 combined team mass**. This change does not require new Firebase security rules compared with Build 1.8.0.
