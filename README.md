@@ -1,81 +1,46 @@
-# Blob Buddies — Join Fix Build 1.3.1
+# Blob Buddies — Build 1.4.0 Big World
 
-This build fixes `permission_denied` when the second player joins from an older/cached client.
+A 2-player Agar.io-inspired browser co-op game synchronized with Firebase Realtime Database.
 
-## Important
-1. Deploy the included `database.rules.json` to **Firebase Console → Realtime Database → Rules**.
-2. Upload/serve all files from this ZIP.
-3. Both players should hard-refresh the page (Ctrl+F5 / Cmd+Shift+R) or clear the site's cached data.
-4. Make a NEW room after deploying the rules.
-5. Firebase Authentication → Sign-in method → Anonymous must be enabled.
+## What changed in this build
 
-The rules accept the older player schema without `pieces`; the current client automatically writes the split-cell `pieces` state after joining.
-
-# Blob Buddies — 2 Player Co-op + Splitting Enemy Bots
-
-An Agar.io-inspired browser co-op game that synchronizes two players and an enemy-bot ecosystem through **Firebase Realtime Database**.
-
-## Features
-
-- 6-character room codes
-- Exactly two player slots, claimed with Realtime Database transactions
-- Anonymous Firebase Authentication
-- Realtime player position, mass, and split-cell synchronization
-- **600 team-mass goal**
-- **Player splitting:** press `Space` on desktop or tap the on-screen `SPLIT` button
-- Players can have up to **4 cells** at once
-- Split cells launch toward the cursor/finger aim, stay separated temporarily, then automatically merge again
-- **8 enemy bot families** with host-authoritative AI
-- Bots roam, hunt smaller player cells, flee from larger cells, and seek pellets
-- **Bots can split-attack players**, creating synchronized child cells
-- Bot-family cells automatically merge again after their split cooldown
-- Bots eat pellets, grow, and different bot families can eat one another
-- Players can eat sufficiently smaller bot cells and gain their mass
-- Larger bot cells can eat individual player split cells; if all player cells are lost, the player respawns with a short shield
-- Shared food pellets with transaction-based claiming
-- Host migration if the current host disconnects
-- `onDisconnect()` ghost-player cleanup
-- Mouse, pen, and touch movement controls
-- Responsive canvas UI
+- Team goal increased to **5000 mass**.
+- Enemy population increased to **50 bot families**. Bots can still split, so the number of visible enemy cells can temporarily exceed 50.
+- Added a live **Top 10 leaderboard** in the top-right. It ranks both individual players and enemy bot families by mass. Split cells from the same bot family are combined for ranking.
+- World increased from **3000×2000 to 9000×6000**. This is a +200% increase in each dimension (3× width and height, 9× area).
+- Food target increased to **500 pellets** to better populate the larger world.
+- Added an **off-screen co-op partner arrow**. When your buddy leaves the visible screen, a small arrow at the screen edge points toward them.
+- Existing player and bot splitting remains enabled.
+- Existing second-player join compatibility fix remains included.
 
 ## Controls
 
 - **Move:** mouse, pen, or finger
-- **Split:** `Space` or the `SPLIT` button
+- **Split:** `Space` or the on-screen `SPLIT` button
 
-A player cell must be large enough before it can split. A split divides that cell's area in half, launches the new cell toward your aim, and preserves total mass. Up to four player cells can exist at once.
+Players can have up to four cells. Bots can also split into multiple cells and later merge.
 
 ## Firebase setup
 
-This copy already contains the Firebase web config supplied for the `testonlinerealtime` project.
+The supplied Firebase web config is already present in `app.js`.
 
-You still need to make sure that:
+You still need to:
 
-1. **Realtime Database** exists in the Firebase project.
-2. **Authentication > Sign-in method > Anonymous** is enabled.
-3. The included `database.rules.json` is deployed. **Deploy the rules from this version** because the player and bot data structures now include split-cell state.
-
-The browser imports use Firebase Web SDK `12.17.1` from Google's CDN.
+1. Enable **Authentication → Sign-in method → Anonymous**.
+2. Create/enable **Realtime Database**.
+3. Publish the included `database.rules.json`. **This build changes the allowed world coordinates to 9000×6000, so the new rules are required.**
+4. Serve the files over HTTP/HTTPS rather than opening `index.html` as a `file://` URL.
+5. After replacing an older build, hard-refresh both browsers and create a new room.
 
 ## Run locally
-
-ES modules should be served over HTTP rather than opened as a raw `file://` page. From this folder, run:
 
 ```bash
 python3 -m http.server 8080
 ```
 
-Then open:
+Then open `http://localhost:8080`.
 
-```text
-http://localhost:8080
-```
-
-For a real two-player test, open the game in two different browser profiles/devices, create a room on one, and join the room code on the other.
-
-## Deploy with Firebase Hosting
-
-If Firebase CLI is installed:
+## Firebase Hosting
 
 ```bash
 firebase login
@@ -83,38 +48,8 @@ firebase use --add
 firebase deploy --only database,hosting
 ```
 
-You can also upload `index.html`, `style.css`, and `app.js` to any static host. Firebase Realtime Database remains the multiplayer backend.
+## Notes on synchronization
 
-## Data layout
+The room host is authoritative for enemy-bot simulation. All clients receive bot state through Realtime Database. The leaderboard is calculated locally from synchronized player and bot state, so it does not add another database write path.
 
-```text
-rooms/{ROOM_CODE}
-  meta/
-    hostUid
-    createdAt
-    goal = 600
-    world
-  players/{0|1}/
-    uid, name, x, y, radius, color, joinedAt, lastSeen
-    pieces/{pieceId}/
-      x, y, radius, vx, vy, mergeAt
-  food/{foodId}/
-    x, y, r, color, claimedBy?
-  bots/{botCellId}/
-    family, name, x, y, radius, color
-    vx, vy, boostX, boostY
-    turnAt, mergeAt, splitReadyAt, eatenBy?
-```
-
-## Synchronization model
-
-Each authenticated player owns and writes only their own player slot, including their split cells. Food and enemy claims use transactions.
-
-Only the room host continuously simulates bot AI and bot splitting. A split bot creates additional bot-cell records belonging to the same `family`. When the host leaves, the existing host-election mechanism transfers bot simulation to the remaining player.
-
-## Production note
-
-This is a playable serverless prototype, not an authoritative competitive game server. A modified browser client can still cheat. For competitive gameplay, move collision/mass validation to an authoritative server and consider protections such as Firebase App Check.
-
-### RTDB rules compatibility note
-Player split pieces use the fixed IDs `p0`, `p1`, `p2`, and `p3`. This lets Realtime Database Security Rules enforce the four-piece cap without relying on an unsupported child-count function.
+With 50 bot families and bot splitting, this build is intentionally heavier than the earlier 8-bot version. For a public competitive deployment, an authoritative game server would scale better than client-hosted simulation over Realtime Database.

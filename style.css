@@ -74,7 +74,7 @@ summary { cursor: pointer; color: #cfd6e9; }
   position: fixed;
   top: max(14px, env(safe-area-inset-top));
   left: 14px;
-  right: 14px;
+  right: 238px;
   display: flex;
   gap: 10px;
   align-items: flex-start;
@@ -102,6 +102,47 @@ summary { cursor: pointer; color: #cfd6e9; }
 .player-line { display: flex; align-items: center; gap: 6px; color: #dce1f1; }
 .enemies-card strong { color: #ff8792; font-size: 13px; }
 .dot { width: 8px; height: 8px; border-radius: 999px; flex: 0 0 auto; }
+
+.leaderboard {
+  position: fixed;
+  top: max(14px, env(safe-area-inset-top));
+  right: 14px;
+  width: 210px;
+  max-height: min(430px, calc(100vh - 96px));
+  padding: 11px 12px 10px;
+  border: 1px solid rgba(255,255,255,.12);
+  border-radius: 16px;
+  background: rgba(8, 12, 25, .76);
+  backdrop-filter: blur(12px);
+  box-shadow: 0 8px 30px rgba(0,0,0,.2);
+  pointer-events: none;
+  z-index: 4;
+}
+.leaderboard-title {
+  margin-bottom: 7px;
+  color: #a9b5d2;
+  font-size: 10px;
+  font-weight: 900;
+  letter-spacing: .16em;
+}
+.leaderboard-list { display: grid; gap: 3px; }
+.leaderboard-row {
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 6px;
+  min-height: 22px;
+  padding: 2px 4px;
+  border-radius: 7px;
+  color: #c8d0e5;
+  font-size: 11px;
+}
+.leaderboard-row.player { color: #e9edff; }
+.leaderboard-row.self { background: rgba(114,231,255,.13); }
+.leaderboard-row.partner { background: rgba(167,139,250,.11); }
+.leaderboard-rank { color: #6f7d9d; font-variant-numeric: tabular-nums; }
+.leaderboard-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 750; }
+.leaderboard-mass { color: #9ba8c7; font-variant-numeric: tabular-nums; font-weight: 850; }
 
 .banner {
   position: fixed;
@@ -158,4 +199,17 @@ summary { cursor: pointer; color: #cfd6e9; }
 @media (pointer: coarse) {
   .split { min-width: 126px; min-height: 50px; font-size: 15px; }
   .split span { display: none; }
+}
+
+@media (max-width: 900px) {
+  .hud { right: 194px; }
+  .leaderboard { width: 170px; }
+  .leaderboard-row { grid-template-columns: 17px minmax(0, 1fr) auto; gap: 4px; font-size: 10px; }
+}
+@media (max-width: 560px) {
+  .hud { right: 14px; top: 14px; padding-right: 154px; }
+  .leaderboard { width: 146px; padding: 9px; }
+  .leaderboard-mass { display: none; }
+  .leaderboard-row { grid-template-columns: 16px minmax(0, 1fr); }
+  .players-card { display: none; }
 }

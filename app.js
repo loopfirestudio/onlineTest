@@ -26,10 +26,10 @@ const firebaseConfig = {
   appId: "1:257019969127:web:0a910b0fe08fde4d60dec2",
 };
 
-const BUILD_VERSION = "1.3.1-joinfix";
-const WORLD = { width: 3000, height: 2000 };
-const FOOD_TARGET = 130;
-const TEAM_GOAL = 600;
+const BUILD_VERSION = "1.4.0-bigworld";
+const WORLD = { width: 9000, height: 6000 };
+const FOOD_TARGET = 500;
+const TEAM_GOAL = 5000;
 const START_RADIUS = 30;
 
 const MAX_PLAYER_PIECES = 4;
@@ -38,7 +38,7 @@ const PLAYER_SPLIT_BOOST = 650;
 const PLAYER_MERGE_MS = 6500;
 const PLAYER_SPLIT_COOLDOWN_MS = 350;
 
-const BOT_FAMILY_COUNT = 8;
+const BOT_FAMILY_COUNT = 50;
 const BOT_EAT_RATIO = 1.14;
 const BOT_RESPAWN_MIN_RADIUS = 22;
 const BOT_RESPAWN_MAX_RADIUS = 43;
@@ -70,6 +70,8 @@ const goalEl = document.querySelector("#goal");
 const progressBar = document.querySelector("#progressBar");
 const playersList = document.querySelector("#playersList");
 const botsCountEl = document.querySelector("#botsCount");
+const leaderboard = document.querySelector("#leaderboard");
+const leaderboardList = document.querySelector("#leaderboardList");
 const banner = document.querySelector("#banner");
 
 goalEl.textContent = String(TEAM_GOAL);
@@ -167,7 +169,7 @@ function makeBot(index = 0, id = `bot${index}`) {
   const now = Date.now();
   return {
     family: `bot${index}`,
-    name: BOT_NAMES[index % BOT_NAMES.length],
+    name: `${BOT_NAMES[index % BOT_NAMES.length]} ${String(index + 1).padStart(2, "0")}`,
     x: 100 + Math.random() * (WORLD.width - 200),
     y: 100 + Math.random() * (WORLD.height - 200),
     radius: Math.round(radius * 100) / 100,
@@ -347,6 +349,7 @@ async function enterRoom(code, player, slot) {
   roomCodeEl.textContent = code;
   menu.classList.add("hidden");
   hud.classList.remove("hidden");
+  leaderboard?.classList.remove("hidden");
   leaveBtn.classList.remove("hidden");
   splitBtn?.classList.remove("hidden");
   setBusy(false, "");
@@ -435,6 +438,7 @@ async function leaveRoom(removeSelf = true) {
   previousPlayerCount = 0;
   hideBanner();
   hud.classList.add("hidden");
+  leaderboard?.classList.add("hidden");
   leaveBtn.classList.add("hidden");
   splitBtn?.classList.add("hidden");
   menu.classList.remove("hidden");
@@ -443,7 +447,7 @@ async function leaveRoom(removeSelf = true) {
 function friendlyError(err) {
   const msg = err?.message || String(err);
   if (msg.includes("auth/operation-not-allowed")) return "Enable Anonymous sign-in in Firebase Authentication.";
-  if (msg.toLowerCase().includes("permission_denied") || msg.toLowerCase().includes("permission denied")) return "Firebase denied the join. Deploy the JOIN-FIX database.rules.json, then hard-refresh both browsers.";
+  if (msg.toLowerCase().includes("permission_denied") || msg.toLowerCase().includes("permission denied")) return "Firebase denied the request. Deploy the database.rules.json from this build, then hard-refresh both browsers.";
   if (msg.includes("Failed to fetch") || msg.includes("network")) return "Network connection failed.";
   return msg;
 }
@@ -454,6 +458,62 @@ function playerMass(player) {
 
 function teamMass(players) {
   return Object.values(players).reduce((sum, p) => sum + playerMass(p), 0);
+}
+
+function botFamilyMasses(bots = {}) {
+  const families = new Map();
+  const source = localHost && hostBots.size ? Object.fromEntries(hostBots) : bots;
+  for (const bot of Object.values(source || {})) {
+    if (!bot || bot.eatenBy) continue;
+    const family = bot.family || "bot0";
+    const entry = families.get(family) || { name: bot.name || "Enemy", massArea: 0 };
+    entry.massArea += Math.max(1, (bot.radius || 0) ** 2);
+    if (!entry.name && bot.name) entry.name = bot.name;
+    families.set(family, entry);
+  }
+  return families;
+}
+
+function updateLeaderboard(players = {}, bots = {}) {
+  if (!leaderboardList) return;
+  const rows = [];
+
+  for (const p of Object.values(players).filter(Boolean)) {
+    const source = p.uid === uid && local ? { ...p, pieces: local.pieces, x: local.x, y: local.y, radius: local.radius } : p;
+    rows.push({
+      name: p.name || "Buddy",
+      mass: playerMass(source),
+      type: "player",
+      self: p.uid === uid,
+      partner: p.uid !== uid,
+    });
+  }
+
+  for (const entry of botFamilyMasses(bots).values()) {
+    rows.push({ name: entry.name || "Enemy", mass: Math.round(entry.massArea / 100), type: "bot", self: false, partner: false });
+  }
+
+  rows.sort((a, b) => b.mass - a.mass || a.name.localeCompare(b.name));
+  leaderboardList.textContent = "";
+  rows.slice(0, 10).forEach((row, index) => {
+    const line = document.createElement("div");
+    line.className = `leaderboard-row ${row.type}${row.self ? " self" : ""}${row.partner ? " partner" : ""}`;
+
+    const rank = document.createElement("span");
+    rank.className = "leaderboard-rank";
+    rank.textContent = String(index + 1);
+
+    const name = document.createElement("span");
+    name.className = "leaderboard-name";
+    name.textContent = `${row.name}${row.self ? " · YOU" : row.partner ? " · CO-OP" : ""}`;
+
+    const mass = document.createElement("span");
+    mass.className = "leaderboard-mass";
+    mass.textContent = String(row.mass);
+
+    line.append(rank, name, mass);
+    leaderboardList.append(line);
+  });
 }
 
 function updateHud(players, bots = {}) {
@@ -476,6 +536,8 @@ function updateHud(players, bots = {}) {
     line.append(dot, text);
     playersList.append(line);
   });
+
+  updateLeaderboard(players, bots);
 
   const count = Object.keys(players).length;
   if (count < 2) showBanner(`Waiting for your buddy…\nRoom ${roomId}`);
@@ -1081,7 +1143,7 @@ function hostMaintenance(now) {
   const food = roomState.food || {};
   const missing = FOOD_TARGET - Object.keys(food).length;
   if (missing > 0) {
-    const additions = makeFood(Math.min(missing, 18));
+    const additions = makeFood(Math.min(missing, 45));
     const patch = {};
     for (const [id, item] of Object.entries(additions)) patch[`food/${id}`] = item;
     update(ref(db, `rooms/${roomId}`), patch).catch(console.warn);
@@ -1260,6 +1322,66 @@ function drawPlayers(cam) {
   }
 }
 
+function coopPartnerInfo() {
+  const players = Object.values(roomState?.players || {}).filter(Boolean);
+  const partner = players.find((p) => p.uid !== uid);
+  if (!partner) return null;
+  const aggregate = aggregatePieces(piecesOf(partner));
+  return { player: partner, aggregate };
+}
+
+function drawCoopPartnerArrow(cam) {
+  if (!roomId || !local) return;
+  const info = coopPartnerInfo();
+  if (!info) return;
+
+  const screenX = info.aggregate.x - cam.x;
+  const screenY = info.aggregate.y - cam.y;
+  const pad = Math.max(18, info.aggregate.radius);
+  const onScreen = screenX >= -pad && screenX <= innerWidth + pad && screenY >= -pad && screenY <= innerHeight + pad;
+  if (onScreen) return;
+
+  const cx = innerWidth / 2;
+  const cy = innerHeight / 2;
+  const dx = screenX - cx;
+  const dy = screenY - cy;
+  const dist = Math.hypot(dx, dy) || 1;
+  const ux = dx / dist;
+  const uy = dy / dist;
+
+  const insetX = Math.max(38, innerWidth / 2 - 44);
+  const insetY = Math.max(38, innerHeight / 2 - 54);
+  const tx = Math.abs(ux) > 0.0001 ? insetX / Math.abs(ux) : Infinity;
+  const ty = Math.abs(uy) > 0.0001 ? insetY / Math.abs(uy) : Infinity;
+  const edge = Math.min(tx, ty);
+  let x = cx + ux * edge;
+  let y = cy + uy * edge;
+
+  // Keep the indicator clear of the top-right leaderboard.
+  if (x > innerWidth - 230 && y < 250) y = 258;
+  x = Math.max(32, Math.min(innerWidth - 32, x));
+  y = Math.max(42, Math.min(innerHeight - 42, y));
+
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.rotate(Math.atan2(uy, ux));
+  ctx.shadowColor = info.player.color || "#72e7ff";
+  ctx.shadowBlur = 10;
+  ctx.beginPath();
+  ctx.moveTo(14, 0);
+  ctx.lineTo(-8, -9);
+  ctx.lineTo(-4, 0);
+  ctx.lineTo(-8, 9);
+  ctx.closePath();
+  ctx.fillStyle = info.player.color || "#72e7ff";
+  ctx.fill();
+  ctx.shadowBlur = 0;
+  ctx.lineWidth = 2;
+  ctx.strokeStyle = "rgba(255,255,255,.82)";
+  ctx.stroke();
+  ctx.restore();
+}
+
 function drawDeathNotice(now) {
   if (!deathNotice || now >= deathNoticeUntil) return;
   ctx.save();
@@ -1305,6 +1427,7 @@ function frame(now) {
   drawFood(cam);
   drawBots(cam);
   drawPlayers(cam);
+  drawCoopPartnerArrow(cam);
   drawDirection();
   drawDeathNotice(now);
   requestAnimationFrame(frame);
