@@ -1,11 +1,11 @@
-# Blob Buddies — Build 1.7.0 Performance
+# Blob Buddies — Build 1.7.1 — 30 Bots
 
 A 2-player Agar.io-inspired browser co-op game synchronized with Firebase Realtime Database.
 
 ## What changed in this build
 
 - Arena adjusted to **5000×4000**.
-- Enemy population reduced from 40 to **20 bot families**.
+- Enemy population is now **30 bot families**.
 - Fixed the host-side enemy eating bug. The host now consumes bots directly from its authoritative simulation instead of starting a Firebase transaction that conflicts with its own continuous bot-movement writes.
 - Client-side bot eating keeps the transaction-based claim path.
 - Team goal remains **5000**.

@@ -1,5 +1,5 @@
 // Blob Buddies — 2-player Agar.io-inspired co-op with synchronized personality-driven splitting enemy bots.
-// Build 1.7 fixes host-authoritative eating and reduces CPU/GPU work for large cells.
+// Build 1.7.1 keeps the performance fixes and raises the enemy population to 30 bot families.
 // Firebase Web SDK 12.17.1 via Google's CDN.
 
 import { initializeApp } from "https://www.gstatic.com/firebasejs/12.17.1/firebase-app.js";
@@ -27,7 +27,7 @@ const firebaseConfig = {
   appId: "1:257019969127:web:0a910b0fe08fde4d60dec2",
 };
 
-const BUILD_VERSION = "1.7.0-performance";
+const BUILD_VERSION = "1.7.1-30bots";
 const WORLD = { width: 5000, height: 4000 };
 const FOOD_TARGET = 400;
 const SPIKY_FOOD_CHANCE = 0.025;
@@ -41,7 +41,7 @@ const PLAYER_SPLIT_BOOST = 650;
 const PLAYER_MERGE_MS = 6500;
 const PLAYER_SPLIT_COOLDOWN_MS = 350;
 
-const BOT_FAMILY_COUNT = 20;
+const BOT_FAMILY_COUNT = 30;
 const BOT_EAT_RATIO = 1.10;
 const EAT_OVERLAP_FACTOR = 0.18;
 const BOT_RESPAWN_MIN_RADIUS = 22;
