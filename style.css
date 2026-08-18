@@ -100,6 +100,7 @@ summary { cursor: pointer; color: #cfd6e9; }
 .progress i { display: block; height: 100%; width: 0%; border-radius: inherit; background: linear-gradient(90deg, #66e3ff, #9a79ff); transition: width .25s; }
 #playersList { display: grid; gap: 4px; font-size: 12px; }
 .player-line { display: flex; align-items: center; gap: 6px; color: #dce1f1; }
+.enemies-card strong { color: #ff8792; font-size: 13px; }
 .dot { width: 8px; height: 8px; border-radius: 999px; flex: 0 0 auto; }
 
 .banner {
@@ -134,5 +135,6 @@ summary { cursor: pointer; color: #cfd6e9; }
   .room-card { flex: 0 0 auto; }
   .score-card { order: 3; flex-basis: 100%; max-width: none; }
   .players-card { margin-left: auto; }
+  .enemies-card { display: none; }
   .panel { padding: 22px; }
 }

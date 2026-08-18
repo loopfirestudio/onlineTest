@@ -14,7 +14,7 @@
     <section class="panel">
       <div class="eyebrow">2 PLAYER CO-OP</div>
       <h1>Blob Buddies</h1>
-      <p class="lead">An Agar.io-inspired co-op browser game powered by Firebase Realtime Database.</p>
+      <p class="lead">An Agar.io-inspired co-op browser game with synchronized enemy bots, powered by Firebase Realtime Database.</p>
 
       <label>
         Player name
@@ -36,7 +36,7 @@
       <p id="menuStatus" class="status" role="status"></p>
       <details>
         <summary>Controls</summary>
-        <p>Move your mouse or finger. Your blob follows the pointer. Eat pellets together to reach the team goal.</p>
+        <p>Move your mouse or finger. Eat pellets and smaller enemy bots, flee from larger bots, and grow together to reach the team goal.</p>
       </details>
     </section>
   </main>
@@ -55,6 +55,10 @@
     <div class="hud-card players-card">
       <span class="hud-label">BUDDIES</span>
       <div id="playersList"></div>
+    </div>
+    <div class="hud-card enemies-card">
+      <span class="hud-label">ENEMIES</span>
+      <strong><span id="botsCount">8</span> BOTS</strong>
     </div>
   </section>
 

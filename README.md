@@ -1,15 +1,22 @@
-# Blob Buddies — 2 Player Co-op
+# Blob Buddies — 2 Player Co-op + Enemy Bots
 
-A small Agar.io-inspired co-op game that runs entirely in the browser and syncs two players through **Firebase Realtime Database**.
+An Agar.io-inspired browser co-op game that syncs two players and a shared enemy-bot ecosystem through **Firebase Realtime Database**.
 
 ## Features
 
 - 6-character room codes
-- Exactly two player slots per room, claimed with Realtime Database transactions
+- Exactly two player slots, claimed with Realtime Database transactions
 - Anonymous Firebase Authentication
-- Realtime position/radius sync
+- Realtime player position/radius sync
+- **8 synchronized enemy bots**
+- Host-authoritative bot movement so both players see the same enemies
+- Bot AI that roams, hunts smaller players, flees from larger players, and seeks food
+- Bots eat pellets, grow, and can eat each other
+- Players can eat sufficiently smaller bots and gain mass
+- Larger bots can eat players; eaten players respawn at starting size with a short shield
+- Eaten bots automatically respawn elsewhere at a new starting size
 - Shared food pellets with transaction-based claiming
-- Host migration if the room creator disconnects
+- Host migration if the current host disconnects
 - `onDisconnect()` ghost-player cleanup
 - Mouse, pen, and touch pointer controls
 - Shared team-mass goal
@@ -17,18 +24,19 @@ A small Agar.io-inspired co-op game that runs entirely in the browser and syncs 
 
 ## Firebase setup
 
-1. Create a Firebase project.
-2. Add a **Web App** to the project and copy its config object.
-3. In **Realtime Database**, create a database.
-4. In **Authentication > Sign-in method**, enable **Anonymous** sign-in.
-5. Paste the Firebase config into `app.js`. Make sure the config includes `databaseURL`.
-6. Deploy `database.rules.json` to Realtime Database Rules.
+This copy already contains the Firebase web config supplied for the `testonlinerealtime` project.
 
-The included browser imports use Firebase Web SDK `12.17.1` from Google's CDN.
+You still need to make sure that:
+
+1. **Realtime Database** exists in the Firebase project.
+2. **Authentication > Sign-in method > Anonymous** is enabled.
+3. The included `database.rules.json` is deployed. **Deploy the new rules in this bot-enabled version** because they add permissions/validation for the synchronized `bots` tree.
+
+The browser imports use Firebase Web SDK `12.17.1` from Google's CDN.
 
 ## Run locally
 
-ES modules should be served over HTTP rather than opened as a raw file. From this folder, run one of:
+ES modules should be served over HTTP rather than opened as a raw `file://` page. From this folder, run:
 
 ```bash
 python3 -m http.server 8080
@@ -40,9 +48,11 @@ Then open:
 http://localhost:8080
 ```
 
+For a real two-player test, open the game in two different browser profiles/devices, create a room on one, and join the room code on the other.
+
 ## Deploy with Firebase Hosting
 
-If you have Firebase CLI installed:
+If Firebase CLI is installed:
 
 ```bash
 firebase login
@@ -50,7 +60,7 @@ firebase use --add
 firebase deploy --only database,hosting
 ```
 
-You can also upload `index.html`, `style.css`, and `app.js` to any static host (Netlify, Vercel static hosting, GitHub Pages, Cloudflare Pages, etc.). Realtime Database remains the multiplayer backend.
+You can also upload `index.html`, `style.css`, and `app.js` to any static host. Firebase Realtime Database remains the multiplayer backend.
 
 ## Data layout
 
@@ -65,8 +75,14 @@ rooms/{ROOM_CODE}
     uid, name, x, y, radius, color, joinedAt, lastSeen
   food/{foodId}/
     x, y, r, color, claimedBy?
+  bots/{botId}/
+    name, x, y, radius, color, vx, vy, turnAt, eatenBy?
 ```
 
-## Notes for production
+## Bot synchronization model
 
-This is a playable prototype. Firebase clients are not authoritative game servers, so a modified browser client can cheat. For competitive gameplay, validate movement/growth server-side (for example with a dedicated authoritative server) and add abuse protection such as App Check. The included database rules restrict player writes to their own player record, but room metadata and food still need to be writable by room members for this serverless prototype.
+Only the room host continuously simulates bot AI and writes bot movement to Realtime Database. When the host leaves, the existing host-election mechanism transfers bot simulation to the remaining player. A player eating a bot uses a transaction that can only add their own UID as `eatenBy`; the host then respawns that bot.
+
+## Production note
+
+This is a playable serverless prototype, not an authoritative competitive game server. A modified browser client can still cheat. For competitive gameplay, move collision/mass validation to an authoritative server and add protections such as Firebase App Check.

@@ -19,6 +19,12 @@
           "$foodId": {
             ".write": "auth != null && (root.child('rooms').child($roomId).child('players').child('0').child('uid').val() === auth.uid || root.child('rooms').child($roomId).child('players').child('1').child('uid').val() === auth.uid)"
           }
+        },
+        "bots": {
+          "$botId": {
+            ".write": "auth != null && (root.child('rooms').child($roomId).child('meta').child('hostUid').val() === auth.uid || ((root.child('rooms').child($roomId).child('players').child('0').child('uid').val() === auth.uid || root.child('rooms').child($roomId).child('players').child('1').child('uid').val() === auth.uid) && data.exists() && newData.exists() && !data.child('eatenBy').exists() && newData.child('eatenBy').val() === auth.uid && newData.child('name').val() === data.child('name').val() && newData.child('x').val() === data.child('x').val() && newData.child('y').val() === data.child('y').val() && newData.child('radius').val() === data.child('radius').val() && newData.child('color').val() === data.child('color').val() && newData.child('vx').val() === data.child('vx').val() && newData.child('vy').val() === data.child('vy').val() && newData.child('turnAt').val() === data.child('turnAt').val()))",
+            ".validate": "!newData.exists() || (newData.hasChildren(['name','x','y','radius','color','vx','vy','turnAt']) && newData.child('name').isString() && newData.child('name').val().length <= 18 && newData.child('x').isNumber() && newData.child('x').val() >= 0 && newData.child('x').val() <= 3000 && newData.child('y').isNumber() && newData.child('y').val() >= 0 && newData.child('y').val() <= 2000 && newData.child('radius').isNumber() && newData.child('radius').val() >= 10 && newData.child('radius').val() <= 400 && newData.child('color').isString() && newData.child('vx').isNumber() && newData.child('vy').isNumber() && newData.child('turnAt').isNumber() && (!newData.child('eatenBy').exists() || newData.child('eatenBy').isString()))"
+          }
         }
       }
     }
