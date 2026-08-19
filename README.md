@@ -1,73 +1,30 @@
-# Blob Buddies — Build 1.8.1 — Boss Threshold
+# Blob Buddies — Build 1.8.3 Cannibal + Fear
 
-A 2-player Agar.io-inspired browser co-op game synchronized with Firebase Realtime Database.
+## New in 1.8.3
 
-## What changed in this build
+- Added **Cannibal bots**. Six of the 30 regular bot families use the new Cannibal personality. They actively search a wide area for smaller enemy bot families, split-attack good targets, and keep extra mass from bot-on-bot kills. This lets a normal-looking bot naturally snowball into a giant threat without any boss system.
+- Added a **Fear / reputation system**. Every bot cell a player eats increases that player's room kill count. Rival, Chaos, and Dumb bots become progressively more cautious as a player's kill count rises: they detect that player from farther away, flee sooner, and require a larger size advantage before willingly approaching as a predator.
+- **Hunter bots ignore reputation fear** and remain aggressive toward players, so high kill counts do not make the entire map passive.
+- Player kill counts are shown in the top player HUD as `KILLS`.
+- Kill reputation is stored under the room's host-authoritative `stats/playerKills` data, so both players have separate reputations and the count survives host migration during the room.
 
-- **Bosses are now locked until both players are connected and the team reaches 4000 combined mass.** Fresh rooms start with zero bosses. Once unlocked, a boss fight can finish even if team mass later drops below 4000; defeated bosses will not respawn until the team reaches 4000 again.
+## Existing gameplay retained
 
-- Arena remains **5000×4000**.
-- Enemy population remains **30 regular bot families**.
-- Includes **2 co-op boss families**: Void Titan and Crimson Colossus.
-  - Each boss initially spawns as multiple huge cells.
-  - Bosses aggressively pressure the human team, can split-attack vulnerable players, grow by eating, merge again, and respawn after the whole boss family is defeated.
-  - Boss families can split into up to 6 cells, making them a team encounter rather than one oversized normal bot.
-- Added **mass transfer**. Press `W` or tap `TRANSFER` to donate roughly 8% of your current mass to your teammate (minimum 15, maximum 220 per transfer, with a short cooldown).
-- Removed the rare **+25 spiky pellets** completely. All map pellets are normal food again.
-- Team goal remains **5000**.
-- Maximum individual player cell size remains **10,000** (radius 1000).
-- Existing Hunter, Rival, Chaos, and Dumb bot personalities remain enabled.
-- Top-10 leaderboard, co-op partner arrow, player/bot splitting, host eating fix, and live player-size HUD remain included.
+- 5000×4000 map
+- 30 regular bot families
+- Host can play immediately before Player 2 joins
+- 5000 team goal
+- Maximum displayed cell size 10,000
+- Player and bot splitting/merging
+- Mass transfer between co-op partners
+- Hunter / Rival / Chaos / Dumb personalities plus the new Cannibal personality
+- Top-10 leaderboard
+- Off-screen co-op partner arrow
+- Performance optimizations from the 1.8.x builds
+- No boss enemies
 
-## Performance changes
+## Firebase update required
 
-- Bot simulation now runs at ~25 Hz and bot network snapshots at a lower rate while rendering still uses `requestAnimationFrame`.
-- Canvas resolution is capped at **1.5× device pixel ratio** instead of 2×, reducing fill-rate cost on high-DPI screens.
-- Pellet collision and bot food-search logic now use a **spatial grid**, avoiding full scans of all pellets for most cells.
-- HUD/leaderboard DOM updates are throttled instead of rebuilding on every Realtime Database room snapshot.
-- The leaderboard no longer converts the host bot Map into a temporary object every update.
-- Existing giant-cell LOD, collision squared-distance checks, off-screen culling, and Firebase claim back-pressure remain enabled.
+This build adds `stats/playerKills`, so publish the included `database.rules.json` in Firebase Realtime Database before testing.
 
-## Controls
-
-- **Move:** mouse, pen, or finger
-- **Split:** `Space` or the on-screen `SPLIT` button
-- **Transfer mass:** `W` or the on-screen `TRANSFER` button
-
-Mass transfer is delivered through a small Firebase transfer queue so neither player needs permission to directly edit the other player's database state.
-
-## Firebase setup
-
-The supplied Firebase web config is already present in `app.js`.
-
-You still need to:
-
-1. Enable **Authentication → Sign-in method → Anonymous**.
-2. Create/enable **Realtime Database**.
-3. **Publish the included `database.rules.json`**. This build adds the secure `/transfers` queue required for mass transfer.
-4. Serve the files over HTTP/HTTPS rather than opening `index.html` as a `file://` URL.
-5. Hard-refresh both browsers and create a **new room** after upgrading from an older build.
-
-## Run locally
-
-```bash
-python3 -m http.server 8080
-```
-
-Then open `http://localhost:8080`.
-
-## Firebase Hosting
-
-```bash
-firebase login
-firebase use --add
-firebase deploy --only database,hosting
-```
-
-## Synchronization
-
-The room host is authoritative for regular bots, bosses, bot splitting/merging, bot-vs-bot eating, boss respawns, and pellet maintenance. Each player remains authoritative for their own movement and cell state. Mass transfers are created by the sender and atomically claimed/deleted by the intended recipient.
-
-## Boss unlock rule
-
-Boss spawn/respawn condition: **2 connected players + at least 4000 combined team mass**. This change does not require new Firebase security rules compared with Build 1.8.0.
+After publishing the rules, hard-refresh both browsers and create a new room so the new bot personality distribution is present immediately.

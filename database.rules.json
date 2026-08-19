@@ -43,6 +43,14 @@
             ".write": "auth != null && (((!data.exists() && newData.exists()) && newData.child('fromUid').val() === auth.uid && newData.child('toUid').val() !== auth.uid && (newData.child('toUid').val() === root.child('rooms').child($roomId).child('players').child('0').child('uid').val() || newData.child('toUid').val() === root.child('rooms').child($roomId).child('players').child('1').child('uid').val())) || (data.exists() && !newData.exists() && data.child('toUid').val() === auth.uid))",
             ".validate": "!newData.exists() || (newData.hasChildren(['fromUid','toUid','area','createdAt']) && newData.child('fromUid').isString() && newData.child('fromUid').val() === auth.uid && newData.child('toUid').isString() && newData.child('toUid').val() !== auth.uid && newData.child('area').isNumber() && newData.child('area').val() >= 1500 && newData.child('area').val() <= 22000 && newData.child('createdAt').isNumber() && newData.child('createdAt').val() >= 0)"
           }
+        },
+        "stats": {
+          "playerKills": {
+            "$playerUid": {
+              ".write": "auth != null && root.child('rooms').child($roomId).child('meta').child('hostUid').val() === auth.uid",
+              ".validate": "!newData.exists() || (newData.isNumber() && newData.val() >= 0 && newData.val() <= 100000)"
+            }
+          }
         }
       }
     }

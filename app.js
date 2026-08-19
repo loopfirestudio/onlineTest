@@ -1,5 +1,5 @@
-// Blob Buddies — 2-player Agar.io-inspired co-op with synchronized bots, co-op bosses, splitting, and mass transfer.
-// Build 1.8.1 gates boss encounters behind 4000 combined team mass while keeping the 1.8 performance and transfer systems.
+// Blob Buddies — Agar.io-inspired browser co-op with synchronized bots, splitting, and mass transfer.
+// Build 1.8.3 adds cannibal bots and a player reputation/fear system.
 // Firebase Web SDK 12.17.1 via Google's CDN.
 
 import { initializeApp } from "https://www.gstatic.com/firebasejs/12.17.1/firebase-app.js";
@@ -27,7 +27,7 @@ const firebaseConfig = {
   appId: "1:257019969127:web:0a910b0fe08fde4d60dec2",
 };
 
-const BUILD_VERSION = "1.8.1-boss-threshold";
+const BUILD_VERSION = "1.8.3-cannibal-fear";
 const WORLD = { width: 5000, height: 4000 };
 const FOOD_TARGET = 400;
 const TEAM_GOAL = 5000;
@@ -40,13 +40,6 @@ const PLAYER_MERGE_MS = 6500;
 const PLAYER_SPLIT_COOLDOWN_MS = 350;
 
 const BOT_FAMILY_COUNT = 30;
-const BOSS_FAMILY_COUNT = 2;
-const BOSS_START_CELLS = 2;
-const BOSS_MIN_RADIUS = 790;
-const BOSS_MAX_RADIUS = 875;
-const BOSS_MAX_FAMILY_CELLS = 6;
-const BOSS_RESPAWN_MS = 9000;
-const BOSS_UNLOCK_TEAM_MASS = 4000;
 const BOT_EAT_RATIO = 1.10;
 const EAT_OVERLAP_FACTOR = 0.18;
 const BOT_RESPAWN_MIN_RADIUS = 22;
@@ -83,10 +76,12 @@ const COLORS = ["#72e7ff", "#a78bfa"];
 const FOOD_COLORS = ["#75f0ba", "#ffd166", "#ff7aa8", "#7bdff2", "#b8f2e6", "#cdb4ff"];
 const BOT_COLORS = ["#ff5f6d", "#ff8c42", "#ff477e", "#ef476f", "#f78c6b", "#ff6b6b", "#f25f5c", "#e85d75"];
 const BOT_NAMES = ["Chomper", "Razor", "Glitch", "NomNom", "Viper", "Crimson", "Munch", "Hunter"];
-const BOT_PERSONALITIES = ["hunter", "rival", "chaos", "dumb"];
-const BOT_PERSONALITY_LABELS = { hunter: "Hunter", rival: "Rival", chaos: "Chaos", dumb: "Dumb", boss: "BOSS" };
-const BOSS_NAMES = ["VOID TITAN", "CRIMSON COLOSSUS"];
-const BOSS_COLORS = ["#ffcf4a", "#ff4f9a"];
+const BOT_PERSONALITIES = ["hunter", "rival", "chaos", "dumb", "cannibal"];
+const BOT_PERSONALITY_LABELS = { hunter: "Hunter", rival: "Rival", chaos: "Chaos", dumb: "Dumb", cannibal: "Cannibal" };
+const FEAR_FULL_KILLS = 20;
+const FEAR_EXTRA_RANGE = 700;
+const CANNIBAL_SENSE_RANGE = 1350;
+const CANNIBAL_EAT_GAIN = 0.80;
 
 const canvas = document.querySelector("#game");
 const ctx = canvas.getContext("2d");
@@ -107,7 +102,6 @@ const goalEl = document.querySelector("#goal");
 const progressBar = document.querySelector("#progressBar");
 const playersList = document.querySelector("#playersList");
 const botsCountEl = document.querySelector("#botsCount");
-const bossesCountEl = document.querySelector("#bossesCount");
 const leaderboard = document.querySelector("#leaderboard");
 const leaderboardList = document.querySelector("#leaderboardList");
 const banner = document.querySelector("#banner");
@@ -149,6 +143,8 @@ let lastFoodGridBuildAt = 0;
 let foodGrid = new Map();
 let foodGridSource = null;
 let transferProcessing = new Set();
+let countedBotKills = new Set();
+let hostKillCounts = new Map();
 
 const pointer = { x: innerWidth / 2, y: innerHeight / 2, active: true };
 const renderPlayerPieces = new Map();
@@ -216,9 +212,12 @@ function makeBot(index = 0, id = `bot${index}`) {
   const radius = BOT_RESPAWN_MIN_RADIUS + Math.random() * (BOT_RESPAWN_MAX_RADIUS - BOT_RESPAWN_MIN_RADIUS);
   const now = Date.now();
   const personality = BOT_PERSONALITIES[index % BOT_PERSONALITIES.length];
+  const botName = personality === "cannibal"
+    ? `Cannibal ${String(index + 1).padStart(2, "0")}`
+    : `${BOT_PERSONALITY_LABELS[personality]} ${BOT_NAMES[index % BOT_NAMES.length]} ${String(index + 1).padStart(2, "0")}`;
   return {
     family: `bot${index}`,
-    name: `${BOT_PERSONALITY_LABELS[personality]} ${BOT_NAMES[index % BOT_NAMES.length]} ${String(index + 1).padStart(2, "0")}`,
+    name: botName.slice(0, 18),
     personality,
     x: 100 + Math.random() * (WORLD.width - 200),
     y: 100 + Math.random() * (WORLD.height - 200),
@@ -240,48 +239,7 @@ function makeBots(count = BOT_FAMILY_COUNT) {
   return bots;
 }
 
-function makeBossFamily(index = 0) {
-  const family = `boss${index}`;
-  const cells = {};
-  const baseAngle = index * Math.PI + Math.random() * 0.35;
-  const spawnSeed = `${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 5)}`;
-  const anchorX = index % 2 === 0 ? WORLD.width * 0.22 : WORLD.width * 0.78;
-  const anchorY = index % 2 === 0 ? WORLD.height * 0.22 : WORLD.height * 0.78;
-  const radius = BOSS_MIN_RADIUS + Math.random() * (BOSS_MAX_RADIUS - BOSS_MIN_RADIUS);
-  for (let c = 0; c < BOSS_START_CELLS; c++) {
-    const angle = baseAngle + c * Math.PI;
-    const id = `${family}_${spawnSeed}_${String.fromCharCode(97 + c)}`;
-    cells[id] = {
-      family,
-      name: BOSS_NAMES[index % BOSS_NAMES.length],
-      personality: "boss",
-      boss: true,
-      x: Math.max(radius, Math.min(WORLD.width - radius, anchorX + Math.cos(angle) * radius * 0.72)),
-      y: Math.max(radius, Math.min(WORLD.height - radius, anchorY + Math.sin(angle) * radius * 0.72)),
-      radius: Math.round(radius * 100) / 100,
-      color: BOSS_COLORS[index % BOSS_COLORS.length],
-      vx: Math.cos(angle),
-      vy: Math.sin(angle),
-      boostX: 0,
-      boostY: 0,
-      turnAt: Date.now() + 900,
-      mergeAt: Date.now() + 15000,
-      splitReadyAt: Date.now() + 3200 + Math.floor(Math.random() * 1500),
-    };
-  }
-  return cells;
-}
-
-function makeBosses(count = BOSS_FAMILY_COUNT) {
-  const bosses = {};
-  for (let i = 0; i < count; i++) Object.assign(bosses, makeBossFamily(i));
-  return bosses;
-}
-
 function makeInitialEnemies() {
-  // Bosses are deliberately excluded from initial room creation. They unlock
-  // only after both co-op players are present and their combined mass reaches
-  // BOSS_UNLOCK_TEAM_MASS.
   return makeBots();
 }
 
@@ -377,6 +335,7 @@ async function createRoom() {
       players: { 0: player },
       food: makeFood(),
       bots: makeInitialEnemies(),
+      stats: { playerKills: { [uid]: 0 } },
     });
 
     await enterRoom(candidate, player, 0);
@@ -544,6 +503,8 @@ async function leaveRoom(removeSelf = true) {
   botMealProcessing.clear();
   botRespawnAt.clear();
   transferProcessing.clear();
+  countedBotKills.clear();
+  hostKillCounts.clear();
   foodGrid.clear();
   foodGridSource = null;
   won = false;
@@ -577,17 +538,32 @@ function teamMass(players) {
   return Object.values(players).reduce((sum, p) => sum + playerMass(p), 0);
 }
 
-function currentTeamMassForBosses() {
-  const players = Object.values(roomState?.players || {}).filter(Boolean);
-  let mass = 0;
-  for (const p of players) {
-    const source = p.uid === uid && local
-      ? { ...p, pieces: local.pieces, x: local.x, y: local.y, radius: local.radius }
-      : p;
-    mass += playerMass(source);
+function syncHostKillCounts() {
+  const remote = roomState?.stats?.playerKills || {};
+  for (const [playerUid, value] of Object.entries(remote)) {
+    const count = Math.max(0, Number(value) || 0);
+    if (count > (hostKillCounts.get(playerUid) || 0)) hostKillCounts.set(playerUid, count);
   }
-  return { mass, playerCount: players.length };
 }
+
+function playerKillCount(playerUid) {
+  if (!playerUid) return 0;
+  const remote = Math.max(0, Number(roomState?.stats?.playerKills?.[playerUid]) || 0);
+  return Math.max(remote, hostKillCounts.get(playerUid) || 0);
+}
+
+function recordPlayerBotKill(playerUid, botId) {
+  if (!localHost || !roomId || !playerUid || !botId || countedBotKills.has(botId)) return;
+  countedBotKills.add(botId);
+  syncHostKillCounts();
+  const next = playerKillCount(playerUid) + 1;
+  hostKillCounts.set(playerUid, next);
+  set(ref(db, `rooms/${roomId}/stats/playerKills/${playerUid}`), next).catch((err) => {
+    console.warn("Kill counter update failed", err);
+    countedBotKills.delete(botId);
+  });
+}
+
 
 function growRadiusFromFood(radius, food, normalFactor = 0.82) {
   const currentArea = Math.max(1, radius ** 2);
@@ -615,9 +591,8 @@ function botFamilyMasses(bots = {}) {
   for (const bot of source) {
     if (!bot || bot.eatenBy) continue;
     const family = bot.family || "bot0";
-    const entry = families.get(family) || { name: bot.name || "Enemy", massArea: 0, boss: !!bot.boss };
+    const entry = families.get(family) || { name: bot.name || "Enemy", massArea: 0 };
     entry.massArea += Math.max(1, (bot.radius || 0) ** 2);
-    entry.boss ||= !!bot.boss;
     if (!entry.name && bot.name) entry.name = bot.name;
     families.set(family, entry);
   }
@@ -640,7 +615,7 @@ function updateLeaderboard(players = {}, bots = {}) {
   }
 
   for (const entry of botFamilyMasses(bots).values()) {
-    rows.push({ name: entry.name || "Enemy", mass: Math.round(entry.massArea / 100), type: entry.boss ? "boss" : "bot", self: false, partner: false });
+    rows.push({ name: entry.name || "Enemy", mass: Math.round(entry.massArea / 100), type: "bot", self: false, partner: false });
   }
 
   rows.sort((a, b) => b.mass - a.mass || a.name.localeCompare(b.name));
@@ -669,15 +644,12 @@ function updateLeaderboard(players = {}, bots = {}) {
 function updateHud(players, bots = {}) {
   const mass = teamMass(players);
   const liveBotFamilies = new Set();
-  const liveBossFamilies = new Set();
   for (const b of Object.values(bots)) {
     if (!b || b.eatenBy) continue;
     const family = b.family || "bot0";
-    if (b.boss || family.startsWith("boss")) liveBossFamilies.add(family);
-    else liveBotFamilies.add(family);
+    if (String(family).startsWith("bot")) liveBotFamilies.add(family);
   }
   if (botsCountEl) botsCountEl.textContent = String(liveBotFamilies.size);
-  if (bossesCountEl) bossesCountEl.textContent = String(liveBossFamilies.size);
   scoreEl.textContent = String(mass);
   progressBar.style.width = `${Math.min(100, (mass / TEAM_GOAL) * 100)}%`;
 
@@ -692,7 +664,8 @@ function updateHud(players, bots = {}) {
     const source = p.uid === uid && local ? { ...p, pieces: local.pieces, x: local.x, y: local.y, radius: local.radius } : p;
     const cells = Object.keys(piecesOf(source)).length;
     const size = playerMass(source);
-    text.textContent = `${p.name || "Buddy"}${p.uid === uid ? " (you)" : ""} · SIZE ${size} · ${cells} cell${cells === 1 ? "" : "s"}`;
+    const kills = playerKillCount(p.uid);
+    text.textContent = `${p.name || "Buddy"}${p.uid === uid ? " (you)" : ""} · SIZE ${size} · KILLS ${kills} · ${cells} cell${cells === 1 ? "" : "s"}`;
     line.append(dot, text);
     playersList.append(line);
   });
@@ -700,8 +673,17 @@ function updateHud(players, bots = {}) {
   updateLeaderboard(players, bots);
 
   const count = Object.keys(players).length;
-  if (count < 2) showBanner(`Waiting for your buddy…\nRoom ${roomId}`);
-  else if (mass >= TEAM_GOAL) {
+  if (transferBtn) {
+    transferBtn.disabled = count < 2;
+    transferBtn.title = count < 2 ? "Your buddy can join anytime; mass transfer unlocks when they arrive." : "Transfer mass to your co-op partner";
+  }
+  if (count < 2) {
+    const waiting = document.createElement("div");
+    waiting.className = "player-line waiting-line";
+    waiting.textContent = "Solo mode · buddy can join anytime";
+    playersList.append(waiting);
+  }
+  if (mass >= TEAM_GOAL) {
     won = true;
     showBanner("Team goal reached! 🎉\nKeep eating or start a new room.");
   } else if (!won) hideBanner();
@@ -821,7 +803,7 @@ async function processIncomingTransfers(transfers = {}) {
 }
 
 function splitLocalPlayer() {
-  if (!roomId || !local || Object.keys(roomState?.players || {}).length < 2) return;
+  if (!roomId || !local) return;
   const now = Date.now();
   if (now - lastPlayerSplitAt < PLAYER_SPLIT_COOLDOWN_MS) return;
   const entries = Object.entries(local.pieces || {}).sort((a, b) => b[1].radius - a[1].radius);
@@ -917,7 +899,6 @@ function resolvePlayerPieceInteractions(dt) {
 function tickMovement(dt) {
   if (!roomId || !roomState || !local) return;
   const players = roomState.players || {};
-  if (Object.keys(players).length < 2) return;
 
   const aim = currentAim();
   for (const piece of Object.values(local.pieces || {})) {
@@ -1088,6 +1069,7 @@ function consumeBotAsHost(botId, bot, pieceId) {
   piece.radius = Math.min(MAX_CELL_RADIUS, Math.sqrt(piece.radius ** 2 + liveBot.radius ** 2 * 0.72));
   syncLocalAggregate();
   writeLocalNow();
+  recordPlayerBotKill(uid, botId);
   deleteBotCell(botId, liveBot.family);
   queueMicrotask(() => botClaiming.delete(botId));
 }
@@ -1192,11 +1174,12 @@ function deleteBotCell(botId, familyHint = null) {
   botRemoving.add(botId);
   hostBots.delete(botId);
 
-  if (family && !familyCells(family).length && !botRespawnAt.has(family)) {
-    botRespawnAt.set(family, Date.now() + (family.startsWith("boss") ? BOSS_RESPAWN_MS : 700 + Math.floor(Math.random() * 800)));
+  if (family && String(family).startsWith("bot") && !familyCells(family).length && !botRespawnAt.has(family)) {
+    botRespawnAt.set(family, Date.now() + 700 + Math.floor(Math.random() * 800));
   }
 
   remove(ref(db, `rooms/${roomId}/bots/${botId}`))
+    .then(() => countedBotKills.delete(botId))
     .catch(console.warn)
     .finally(() => botRemoving.delete(botId));
 }
@@ -1234,59 +1217,22 @@ function ensureBotFamilies() {
   }
 }
 
-function ensureBossFamilies() {
-  if (!localHost || !roomId) return;
-
-  const { mass: combinedMass, playerCount } = currentTeamMassForBosses();
-  const bossesUnlocked = playerCount >= 2 && combinedMass >= BOSS_UNLOCK_TEAM_MASS;
-
-  // Existing boss fights are allowed to finish if the team later drops below
-  // the threshold. However, no new boss family is spawned or respawned until
-  // both players are connected and the team is back at 4000+ combined mass.
-  if (!bossesUnlocked) {
-    for (let i = 0; i < BOSS_FAMILY_COUNT; i++) {
-      const family = `boss${i}`;
-      if (!familyCells(family).length) botRespawnAt.delete(family);
-    }
-    return;
-  }
-
-  const now = Date.now();
-  for (let i = 0; i < BOSS_FAMILY_COUNT; i++) {
-    const family = `boss${i}`;
-    if (familyCells(family).length) {
-      botRespawnAt.delete(family);
-      continue;
-    }
-    if (!botRespawnAt.has(family)) {
-      botRespawnAt.set(family, now + BOSS_RESPAWN_MS);
-      continue;
-    }
-    if (now < botRespawnAt.get(family)) continue;
-    const fresh = makeBossFamily(i);
-    botRespawnAt.delete(family);
-    for (const [id, boss] of Object.entries(fresh)) hostBots.set(id, boss);
-    update(ref(db, `rooms/${roomId}/bots`), fresh).catch((err) => {
-      console.warn("Boss respawn failed", err);
-      for (const id of Object.keys(fresh)) hostBots.delete(id);
-      botRespawnAt.set(family, Date.now() + 2200);
-    });
-  }
-}
-
 function ensureHostBots() {
   if (!localHost || !roomState) return;
   const remoteBots = roomState.bots || {};
 
   for (const [id, bot] of Object.entries(remoteBots)) {
     if (!bot) continue;
-    const familyIndex = botIndexFromFamily(bot.family || id);
-    if (String(bot.family || id).startsWith("bot") && familyIndex >= BOT_FAMILY_COUNT) {
-      // Automatically clean up surplus families from rooms created by older builds.
+    const family = String(bot.family || id);
+    const familyIndex = botIndexFromFamily(family);
+    if (!family.startsWith("bot") || familyIndex >= BOT_FAMILY_COUNT) {
+      // Clean up legacy/surplus enemy records from older builds. This build only
+      // supports the 30 regular bot families bot0..bot29.
       if (!botRemoving.has(id)) deleteBotCell(id, bot.family);
       continue;
     }
     if (bot.eatenBy) {
+      recordPlayerBotKill(bot.eatenBy, id);
       deleteBotCell(id, bot.family);
       continue;
     }
@@ -1300,15 +1246,15 @@ function ensureHostBots() {
   }
 
   ensureBotFamilies();
-  ensureBossFamilies();
 }
 
 function allPlayerTargets() {
   const targets = [];
   for (const p of Object.values(roomState?.players || {}).filter(Boolean)) {
     const source = p.uid === uid && local ? local : p;
+    const kills = playerKillCount(p.uid);
     for (const [pieceId, piece] of Object.entries(piecesOf(source))) {
-      targets.push({ ...piece, ownerUid: p.uid, pieceId });
+      targets.push({ ...piece, ownerUid: p.uid, pieceId, kills });
     }
   }
   return targets;
@@ -1338,7 +1284,7 @@ function splitBot(botId, bot, aimX, aimY) {
   const now = Date.now();
   if (bot.radius < BOT_SPLIT_MIN_RADIUS || now < (bot.splitReadyAt || 0)) return false;
   const family = bot.family || `bot${botIndexFromFamily(botId)}`;
-  const familyLimit = bot.boss ? BOSS_MAX_FAMILY_CELLS : BOT_MAX_FAMILY_CELLS;
+  const familyLimit = BOT_MAX_FAMILY_CELLS;
   if (familyCells(family).length >= familyLimit) return false;
 
   const mag = Math.hypot(aimX, aimY) || 1;
@@ -1436,6 +1382,7 @@ function tickBots(dt, now) {
   if (!localHost || !roomId || !roomState) return;
   ensureHostBots();
   processBotMeals();
+  syncHostKillCounts();
   if (!hostBots.size) return;
 
   const playerTargets = allPlayerTargets();
@@ -1447,67 +1394,81 @@ function tickBots(dt, now) {
   for (const [botId, bot] of entriesAtStart) {
     if (!hostBots.has(botId) || botRemoving.has(botId)) continue;
 
-    const personality = bot.boss ? "boss" : (bot.personality || BOT_PERSONALITIES[botIndexFromFamily(bot.family) % BOT_PERSONALITIES.length] || "dumb");
+    const personality = BOT_PERSONALITIES.includes(bot.personality) ? bot.personality : (BOT_PERSONALITIES[botIndexFromFamily(bot.family) % BOT_PERSONALITIES.length] || "dumb");
     bot.personality = personality;
     let dirX = bot.vx || 1;
     let dirY = bot.vy || 0;
     let threat = null;
     let threatDist = Infinity;
+    let threatFear = 0;
     let playerPrey = null;
     let playerPreyDist = Infinity;
     let botPrey = null;
     let botPreyDist = Infinity;
 
-    // Smarter bots understand both players and enemy bot families. Dumb/chaos bots
-    // only notice danger at much shorter range.
-    const threatRange = personality === "boss" ? 980 : personality === "dumb" ? 260 : personality === "chaos" ? 420 : 760;
+    // Reputation/fear: normal bots remember the team's recent bot kills through
+    // the host-owned room counter. The more dangerous a player has proven to be,
+    // the earlier ordinary bots start giving them space. Dedicated Hunters stay
+    // aggressive, while Cannibals mainly care about eating other bot families.
+    const baseThreatRange = personality === "dumb" ? 260 : personality === "chaos" ? 420 : 760;
+    const cautiousAroundReputation = personality !== "hunter" && personality !== "cannibal";
     for (const p of playerTargets) {
       const d = Math.hypot(p.x - bot.x, p.y - bot.y);
-      if (p.radius > bot.radius * BOT_EAT_RATIO && d < threatRange && d < threatDist) { threat = p; threatDist = d; }
-      if (bot.radius > p.radius * BOT_EAT_RATIO && d < 950 && d < playerPreyDist) { playerPrey = p; playerPreyDist = d; }
+      const fear = Math.min(1, Math.max(0, Number(p.kills || 0)) / FEAR_FULL_KILLS);
+      const obviousThreat = p.radius > bot.radius * BOT_EAT_RATIO;
+      const reputationThreat = cautiousAroundReputation
+        && fear > 0.04
+        && p.radius > bot.radius * (0.88 - fear * 0.28);
+      const effectiveThreatRange = baseThreatRange + (cautiousAroundReputation ? fear * FEAR_EXTRA_RANGE : 0);
+      if ((obviousThreat || reputationThreat) && d < effectiveThreatRange && d < threatDist) {
+        threat = p;
+        threatDist = d;
+        threatFear = reputationThreat ? fear : Math.max(threatFear, fear * 0.4);
+      }
+
+      if (bot.radius > p.radius * BOT_EAT_RATIO && d < 950 && d < playerPreyDist) {
+        // High-reputation players are much harder to bait into easy fights: cautious
+        // bots only approach them when they have a very convincing size advantage.
+        const safeEnoughToHunt = !cautiousAroundReputation
+          || fear < 0.20
+          || bot.radius > p.radius * (1.35 + fear * 0.70);
+        if (safeEnoughToHunt) {
+          playerPrey = p;
+          playerPreyDist = d;
+        }
+      }
     }
 
-    if (personality === "hunter" || personality === "rival") {
+    if (personality === "hunter" || personality === "rival" || personality === "cannibal") {
+      const preySense = personality === "cannibal" ? CANNIBAL_SENSE_RANGE : 920;
+      const preyRatio = personality === "cannibal" ? 1.06 : BOT_EAT_RATIO;
+      const botThreatSense = personality === "cannibal" ? 820 : 700;
       for (const [otherId, other] of hostBots) {
         if (otherId === botId || !other || other.eatenBy || other.family === bot.family) continue;
         const d = Math.hypot(other.x - bot.x, other.y - bot.y);
-        if (other.radius > bot.radius * BOT_EAT_RATIO && d < 700 && d < threatDist) {
-          threat = other; threatDist = d;
+        if (other.radius > bot.radius * BOT_EAT_RATIO && d < botThreatSense && d < threatDist) {
+          threat = other;
+          threatDist = d;
+          threatFear = 0;
         }
-        if (bot.radius > other.radius * BOT_EAT_RATIO && d < 920 && d < botPreyDist) {
-          botPrey = other; botPreyDist = d;
+        if (bot.radius > other.radius * preyRatio && d < preySense && d < botPreyDist) {
+          botPrey = other;
+          botPreyDist = d;
         }
       }
     }
 
-    if (personality === "boss") {
-      // Boss cells focus on the human team. They flee only from a cell that can
-      // actually consume them; otherwise they pressure the nearest vulnerable buddy.
-      let nearestPlayer = null;
-      let nearestPlayerDist = Infinity;
-      for (const p of playerTargets) {
-        const dx = p.x - bot.x;
-        const dy = p.y - bot.y;
-        const d = Math.hypot(dx, dy);
-        if (d < nearestPlayerDist) { nearestPlayer = p; nearestPlayerDist = d; }
-      }
-      if (threat && threat.ownerUid) {
-        dirX = bot.x - threat.x;
-        dirY = bot.y - threat.y;
-      } else if (playerPrey) {
-        dirX = playerPrey.x - bot.x;
-        dirY = playerPrey.y - bot.y;
-        const childRadius = bot.radius / Math.sqrt(2);
-        if (playerPreyDist > bot.radius * 1.2 && playerPreyDist < 620 && childRadius > playerPrey.radius * 1.12) {
-          splitBot(botId, bot, dirX, dirY);
-        }
-      } else if (nearestPlayer) {
-        dirX = nearestPlayer.x - bot.x;
-        dirY = nearestPlayer.y - bot.y;
-      }
-    } else if (threat) {
+    if (threat) {
       dirX = bot.x - threat.x;
       dirY = bot.y - threat.y;
+    } else if (personality === "cannibal" && botPrey) {
+      // Cannibals actively create their own snowball: they seek other families
+      // across a large radius and split only when it gives them a strong eat angle.
+      dirX = botPrey.x - bot.x;
+      dirY = botPrey.y - bot.y;
+      if (botPreyDist > bot.radius * 1.35 && botPreyDist < 520 && bot.radius > botPrey.radius * 1.42) {
+        splitBot(botId, bot, dirX, dirY);
+      }
     } else if (personality === "hunter" && playerPrey) {
       // Hunter bots prioritize the human team and deliberately split-attack.
       dirX = playerPrey.x - bot.x;
@@ -1524,12 +1485,12 @@ function tickBots(dt, now) {
       if (preyDist > bot.radius * 1.4 && preyDist < 450 && bot.radius > prey.radius * 1.45) {
         splitBot(botId, bot, dirX, dirY);
       }
-    } else if (personality !== "dumb" && playerPrey && personality !== "chaos") {
+    } else if (personality !== "dumb" && playerPrey && personality !== "chaos" && personality !== "cannibal") {
       dirX = playerPrey.x - bot.x;
       dirY = playerPrey.y - bot.y;
     } else {
       let nearestFood = null;
-      const foodSense = personality === "dumb" ? 280 : 520;
+      const foodSense = personality === "dumb" ? 280 : personality === "cannibal" ? 620 : 520;
       let nearestFoodDistSq = foodSense * foodSense;
       // Dumb bots are bad at choosing food; chaos bots are slightly better but unstable.
       if (personality !== "dumb" || Math.random() < 0.35) {
@@ -1548,8 +1509,8 @@ function tickBots(dt, now) {
         const angle = Math.random() * Math.PI * 2;
         dirX = Math.cos(angle);
         dirY = Math.sin(angle);
-        const turnMin = personality === "dumb" ? 450 : personality === "chaos" ? 650 : 1100;
-        const turnSpread = personality === "dumb" ? 1300 : personality === "chaos" ? 1700 : 2800;
+        const turnMin = personality === "dumb" ? 450 : personality === "chaos" ? 650 : personality === "cannibal" ? 800 : 1100;
+        const turnSpread = personality === "dumb" ? 1300 : personality === "chaos" ? 1700 : personality === "cannibal" ? 1700 : 2800;
         bot.turnAt = Date.now() + turnMin + Math.floor(Math.random() * turnSpread);
       }
     }
@@ -1568,16 +1529,16 @@ function tickBots(dt, now) {
     if (bot.y > WORLD.height - wallMargin) dirY -= 1.8;
 
     const mag = Math.hypot(dirX, dirY) || 1;
-    const steering = personality === "dumb" ? 1.2 : personality === "chaos" ? 2.0 : 3.6;
+    const steering = personality === "dumb" ? 1.2 : personality === "chaos" ? 2.0 : personality === "cannibal" ? 4.0 : 3.6;
     bot.vx += (dirX / mag - bot.vx) * Math.min(1, dt * steering);
     bot.vy += (dirY / mag - bot.vy) * Math.min(1, dt * steering);
     const vmag = Math.hypot(bot.vx, bot.vy) || 1;
     bot.vx /= vmag;
     bot.vy /= vmag;
 
-    const speedBase = personality === "boss" ? 330 : personality === "hunter" ? 250 : personality === "rival" ? 242 : personality === "chaos" ? 232 : 218;
-    const minSpeed = personality === "boss" ? 92 : 66;
-    const speed = Math.max(minSpeed, speedBase - bot.radius * (personality === "boss" ? 0.30 : 1.45)) * (threat ? 1.18 : 1);
+    const speedBase = personality === "hunter" ? 250 : personality === "cannibal" ? 246 : personality === "rival" ? 242 : personality === "chaos" ? 232 : 218;
+    const fleeBoost = threat ? 1.18 + threatFear * 0.22 : 1;
+    const speed = Math.max(66, speedBase - bot.radius * 1.45) * fleeBoost;
     bot.x += bot.vx * speed * dt + (bot.boostX || 0) * dt;
     bot.y += bot.vy * speed * dt + (bot.boostY || 0) * dt;
     const boostDrag = Math.pow(0.03, dt);
@@ -1619,14 +1580,14 @@ function tickBots(dt, now) {
       if (canConsumeSquared(a.radius, b.radius, distSq)) [bigId, big, smallId, small] = [idA, a, idB, b];
       else if (canConsumeSquared(b.radius, a.radius, distSq)) [bigId, big, smallId, small] = [idB, b, idA, a];
       else continue;
-      big.radius = Math.min(MAX_CELL_RADIUS, Math.sqrt(big.radius ** 2 + small.radius ** 2 * 0.64));
+      const botEatGain = big.personality === "cannibal" ? CANNIBAL_EAT_GAIN : 0.64;
+      big.radius = Math.min(MAX_CELL_RADIUS, Math.sqrt(big.radius ** 2 + small.radius ** 2 * botEatGain));
       hostBots.set(bigId, big);
       deleteBotCell(smallId, small.family);
     }
   }
 
   ensureBotFamilies();
-  ensureBossFamilies();
 
   if (now - lastBotNetworkWrite > BOT_NETWORK_INTERVAL_MS) {
     lastBotNetworkWrite = now;
@@ -1636,7 +1597,6 @@ function tickBots(dt, now) {
       patch[`bots/${id}/family`] = bot.family;
       patch[`bots/${id}/name`] = bot.name;
       patch[`bots/${id}/personality`] = bot.personality || "dumb";
-      patch[`bots/${id}/boss`] = !!bot.boss;
       patch[`bots/${id}/x`] = Math.round(bot.x * 10) / 10;
       patch[`bots/${id}/y`] = Math.round(bot.y * 10) / 10;
       patch[`bots/${id}/radius`] = Math.round(bot.radius * 100) / 100;
@@ -1780,16 +1740,9 @@ function drawBots(cam) {
     ctx.fill();
     ctx.shadowBlur = 0;
     ctx.lineWidth = Math.max(2.5, Math.min(12, r * 0.075));
-    ctx.strokeStyle = bot.boss ? "rgba(255,239,155,.92)" : "rgba(80, 3, 20, .72)";
+    ctx.strokeStyle = "rgba(80, 3, 20, .72)";
     ctx.stroke();
 
-    if (bot.boss) {
-      ctx.beginPath();
-      ctx.arc(x, y, Math.max(4, r - Math.min(22, r * 0.055)), 0, Math.PI * 2);
-      ctx.lineWidth = Math.max(3, Math.min(10, r * 0.025));
-      ctx.strokeStyle = "rgba(255,255,255,.38)";
-      ctx.stroke();
-    }
 
     // Detail LOD: giant cells are expensive mostly because of multiple large
     // alpha-blended shapes. Their silhouette/name is enough while zoomed in.
@@ -1814,7 +1767,7 @@ function drawBots(cam) {
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
     ctx.fillStyle = "rgba(54,7,18,.88)";
-    ctx.fillText(`${bot.boss ? "★ " : ""}${bot.name || "Enemy"}`, x, y + Math.min(r * 0.28, 90));
+    ctx.fillText(bot.name || "Enemy", x, y + Math.min(r * 0.28, 90));
     ctx.restore();
   }
 }
@@ -1943,7 +1896,7 @@ function drawDeathNotice(now) {
 }
 
 function drawDirection() {
-  if (!roomId || !local || Object.keys(roomState?.players || {}).length < 2) return;
+  if (!roomId || !local) return;
   const dx = pointer.x - innerWidth / 2;
   const dy = pointer.y - innerHeight / 2;
   const dist = Math.hypot(dx, dy);
