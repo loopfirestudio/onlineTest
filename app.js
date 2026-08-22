@@ -1,9 +1,9 @@
-// Blob Buddies — Agar.io-inspired browser co-op with synchronized bots, splitting, and mass transfer.
-// Build 1.8.3 adds cannibal bots and a player reputation/fear system.
+// Blob Royale — Agar.io-inspired 3-player PvPvE free-for-all with synchronized bots and splitting.
+// Build 2.0.0 adds three player slots, player-vs-player eating, cannibal bots, and fear AI.
 // Firebase Web SDK 12.17.1 via Google's CDN.
 
 import { initializeApp } from "https://www.gstatic.com/firebasejs/12.17.1/firebase-app.js";
-import { getAuth, signInAnonymously } from "https://www.gstatic.com/firebasejs/12.17.1/firebase-auth.js";
+import { getAuth, signInAnonymously, setPersistence, inMemoryPersistence, signOut } from "https://www.gstatic.com/firebasejs/12.17.1/firebase-auth.js";
 import {
   getDatabase,
   ref,
@@ -27,10 +27,9 @@ const firebaseConfig = {
   appId: "1:257019969127:web:0a910b0fe08fde4d60dec2",
 };
 
-const BUILD_VERSION = "1.8.3-cannibal-fear";
+const BUILD_VERSION = "2.0.0-ffa3";
 const WORLD = { width: 5000, height: 4000 };
 const FOOD_TARGET = 400;
-const TEAM_GOAL = 5000;
 const START_RADIUS = 30;
 
 const MAX_PLAYER_PIECES = 4;
@@ -72,7 +71,7 @@ const TRANSFER_MIN_REMAINING_SIZE = 45;
 const MAX_CELL_MASS = 10000;
 const MAX_CELL_RADIUS = Math.sqrt(MAX_CELL_MASS * 100);
 
-const COLORS = ["#72e7ff", "#a78bfa"];
+const COLORS = ["#72e7ff", "#ff7aa8", "#ffd166"];
 const FOOD_COLORS = ["#75f0ba", "#ffd166", "#ff7aa8", "#7bdff2", "#b8f2e6", "#cdb4ff"];
 const BOT_COLORS = ["#ff5f6d", "#ff8c42", "#ff477e", "#ef476f", "#f78c6b", "#ff6b6b", "#f25f5c", "#e85d75"];
 const BOT_NAMES = ["Chomper", "Razor", "Glitch", "NomNom", "Viper", "Crimson", "Munch", "Hunter"];
@@ -89,7 +88,6 @@ const menu = document.querySelector("#menu");
 const hud = document.querySelector("#hud");
 const leaveBtn = document.querySelector("#leaveBtn");
 const splitBtn = document.querySelector("#splitBtn");
-const transferBtn = document.querySelector("#transferBtn");
 const createBtn = document.querySelector("#createBtn");
 const joinBtn = document.querySelector("#joinBtn");
 const copyBtn = document.querySelector("#copyBtn");
@@ -98,15 +96,12 @@ const roomInput = document.querySelector("#roomInput");
 const menuStatus = document.querySelector("#menuStatus");
 const roomCodeEl = document.querySelector("#roomCode");
 const scoreEl = document.querySelector("#score");
-const goalEl = document.querySelector("#goal");
-const progressBar = document.querySelector("#progressBar");
 const playersList = document.querySelector("#playersList");
 const botsCountEl = document.querySelector("#botsCount");
 const leaderboard = document.querySelector("#leaderboard");
 const leaderboardList = document.querySelector("#leaderboardList");
 const banner = document.querySelector("#banner");
 
-goalEl.textContent = String(TEAM_GOAL);
 const buildVersionEl = document.querySelector("#buildVersion");
 if (buildVersionEl) buildVersionEl.textContent = `Build ${BUILD_VERSION}`;
 
@@ -131,20 +126,21 @@ let botClaiming = new Set();
 let botRemoving = new Set();
 let botMealProcessing = new Set();
 let botRespawnAt = new Map();
-let won = false;
 let invulnerableUntil = 0;
 let deathNoticeUntil = 0;
 let deathNotice = "";
 let previousPlayerCount = 0;
 let lastPlayerSplitAt = 0;
-let lastMassTransferAt = 0;
 let lastHudUpdateAt = 0;
 let lastFoodGridBuildAt = 0;
 let foodGrid = new Map();
 let foodGridSource = null;
-let transferProcessing = new Set();
 let countedBotKills = new Set();
 let hostKillCounts = new Map();
+let pvpVictimProcessing = new Set();
+let pvpEaterProcessing = new Set();
+let hostPvpPendingVictims = new Map();
+let countedPvpKillEvents = new Set();
 
 const pointer = { x: innerWidth / 2, y: innerHeight / 2, active: true };
 const renderPlayerPieces = new Map();
@@ -176,9 +172,23 @@ function makePiece(x, y, radius, mergeAt = 0, vx = 0, vy = 0) {
   return { x, y, radius, vx, vy, mergeAt };
 }
 
+function spawnForSlot(slot = 0) {
+  const spawns = [
+    { x: WORLD.width * 0.22, y: WORLD.height * 0.50 },
+    { x: WORLD.width * 0.78, y: WORLD.height * 0.50 },
+    { x: WORLD.width * 0.50, y: WORLD.height * 0.22 },
+  ];
+  const base = spawns[slot % spawns.length] || spawns[0];
+  return {
+    x: Math.max(80, Math.min(WORLD.width - 80, base.x + (Math.random() - 0.5) * 220)),
+    y: Math.max(80, Math.min(WORLD.height - 80, base.y + (Math.random() - 0.5) * 220)),
+  };
+}
+
 function makePlayer(slot = 0) {
-  const x = WORLD.width / 2 + (slot ? 90 : -90);
-  const y = WORLD.height / 2;
+  const spawn = spawnForSlot(slot);
+  const x = spawn.x;
+  const y = spawn.y;
   return {
     uid,
     name: cleanName(nameInput.value),
@@ -188,6 +198,7 @@ function makePlayer(slot = 0) {
     color: COLORS[slot % COLORS.length],
     joinedAt: Date.now(),
     lastSeen: Date.now(),
+    shieldUntil: Date.now() + 1800,
     pieces: { p0: makePiece(x, y, START_RADIUS) },
   };
 }
@@ -296,15 +307,22 @@ function publicPlayerPayload() {
     radius: Math.round(local.radius * 100) / 100,
     pieces,
     lastSeen: Date.now(),
+    shieldUntil: Math.max(0, Math.round(local.shieldUntil || 0)),
   };
 }
 
 async function ensureFirebase() {
   if (!firebaseConfigured()) throw new Error("Firebase is not configured yet. Paste your Firebase web config into app.js first.");
-  if (uid) return;
-  app = initializeApp(firebaseConfig);
-  auth = getAuth(app);
-  db = getDatabase(app);
+  if (uid && auth?.currentUser) return;
+  if (!app) app = initializeApp(firebaseConfig);
+  if (!auth) auth = getAuth(app);
+  if (!db) db = getDatabase(app);
+  await setPersistence(auth, inMemoryPersistence);
+  // Each browser tab gets its own anonymous identity so 3-player testing works
+  // even when all three players use the same browser profile on one PC.
+  if (auth.currentUser) {
+    try { await signOut(auth); } catch (err) { console.warn("Auth reset", err); }
+  }
   const result = await signInAnonymously(auth);
   uid = result.user.uid;
 }
@@ -331,11 +349,11 @@ async function createRoom() {
 
     const player = makePlayer(0);
     await set(ref(db, `rooms/${candidate}`), {
-      meta: { hostUid: uid, createdAt: serverTimestamp(), goal: TEAM_GOAL, world: WORLD },
+      meta: { hostUid: uid, createdAt: serverTimestamp(), mode: "ffa3", maxPlayers: 3, world: WORLD },
       players: { 0: player },
       food: makeFood(),
       bots: makeInitialEnemies(),
-      stats: { playerKills: { [uid]: 0 } },
+      stats: { playerKills: { [uid]: 0 }, pvpKills: { [uid]: 0 } },
     });
 
     await enterRoom(candidate, player, 0);
@@ -362,7 +380,7 @@ async function joinRoom() {
     let player = alreadyInRoom ? alreadyInRoom[1] : null;
 
     if (claimedSlot === null) {
-      for (const slot of [0, 1]) {
+      for (const slot of [0, 1, 2]) {
         const candidate = makePlayer(slot);
         const result = await runTransaction(
           ref(db, `rooms/${code}/players/${slot}`),
@@ -381,7 +399,7 @@ async function joinRoom() {
       }
     }
 
-    if (claimedSlot === null || !player) throw new Error("That room already has two players.");
+    if (claimedSlot === null || !player) throw new Error("That room already has three players.");
     if (!player.pieces) player.pieces = { p0: makePiece(player.x, player.y, player.radius) };
     await enterRoom(code, player, claimedSlot);
   } catch (err) {
@@ -393,9 +411,10 @@ async function joinRoom() {
 async function enterRoom(code, player, slot) {
   roomId = code;
   local = { ...player, pieces: structuredClone(piecesOf(player)) };
+  local.shieldUntil = Math.max(Date.now() + 1800, Number(local.shieldUntil || 0));
+  invulnerableUntil = performance.now() + 1800;
   syncLocalAggregate();
   localSlot = slot;
-  won = false;
   previousPlayerCount = 0;
   lastBotSimAt = 0;
   lastBotNetworkWrite = 0;
@@ -408,7 +427,6 @@ async function enterRoom(code, player, slot) {
   leaderboard?.classList.remove("hidden");
   leaveBtn.classList.remove("hidden");
   splitBtn?.classList.remove("hidden");
-  transferBtn?.classList.remove("hidden");
   setBusy(false, "");
 
   const playerRef = ref(db, `rooms/${roomId}/players/${localSlot}`);
@@ -426,7 +444,6 @@ async function enterRoom(code, player, slot) {
     const players = roomState.players || {};
     const meta = roomState.meta || {};
     const playerValues = Object.values(players);
-    if (playerValues.length >= 2 && previousPlayerCount < 2) invulnerableUntil = Math.max(invulnerableUntil, performance.now() + 2400);
     previousPlayerCount = playerValues.length;
 
     const selfPresent = playerValues.some((p) => p?.uid === uid);
@@ -437,6 +454,8 @@ async function enterRoom(code, player, slot) {
       hostBots.clear();
       botRespawnAt.clear();
       botMealProcessing.clear();
+      hostPvpPendingVictims.clear();
+      countedPvpKillEvents.clear();
       lastBotSimAt = 0;
       lastBotNetworkWrite = 0;
     }
@@ -455,7 +474,8 @@ async function enterRoom(code, player, slot) {
       return;
     }
 
-    processIncomingTransfers(roomState.transfers || {});
+    processPvpEvents(roomState.pvpEvents || {});
+    if (localHost) hostProcessPvpEventAcks(roomState.pvpEvents || {});
     const hudNow = performance.now();
     if (hudNow - lastHudUpdateAt >= HUD_UPDATE_INTERVAL_MS) {
       lastHudUpdateAt = hudNow;
@@ -502,12 +522,14 @@ async function leaveRoom(removeSelf = true) {
   botRemoving.clear();
   botMealProcessing.clear();
   botRespawnAt.clear();
-  transferProcessing.clear();
   countedBotKills.clear();
   hostKillCounts.clear();
+  pvpVictimProcessing.clear();
+  pvpEaterProcessing.clear();
+  hostPvpPendingVictims.clear();
+  countedPvpKillEvents.clear();
   foodGrid.clear();
   foodGridSource = null;
-  won = false;
   invulnerableUntil = 0;
   deathNoticeUntil = 0;
   previousPlayerCount = 0;
@@ -518,7 +540,6 @@ async function leaveRoom(removeSelf = true) {
   leaderboard?.classList.add("hidden");
   leaveBtn.classList.add("hidden");
   splitBtn?.classList.add("hidden");
-  transferBtn?.classList.add("hidden");
   menu.classList.remove("hidden");
 }
 
@@ -534,8 +555,12 @@ function playerMass(player) {
   return Math.round(aggregatePieces(piecesOf(player)).area / 100);
 }
 
-function teamMass(players) {
-  return Object.values(players).reduce((sum, p) => sum + playerMass(p), 0);
+function playerPvpKillCount(playerUid) {
+  return Math.max(0, Number(roomState?.stats?.pvpKills?.[playerUid]) || 0);
+}
+
+function playerThreatKillCount(playerUid) {
+  return playerKillCount(playerUid) + playerPvpKillCount(playerUid);
 }
 
 function syncHostKillCounts() {
@@ -585,6 +610,156 @@ function canConsumeSquared(bigRadius, smallRadius, distanceSq, ratio = BOT_EAT_R
   return threshold > 0 && distanceSq <= threshold * threshold;
 }
 
+function playerSlotByUid(playerUid) {
+  for (const [slot, p] of Object.entries(roomState?.players || {})) if (p?.uid === playerUid) return String(slot);
+  return null;
+}
+
+function localLargestPieceId() {
+  const best = Object.entries(local?.pieces || {}).sort((a, b) => b[1].radius - a[1].radius)[0];
+  return best?.[0] || null;
+}
+
+function hostResolvePvp(nowMs = Date.now()) {
+  if (!localHost || !roomId || !roomState) return;
+  const players = roomState.players || {};
+  const entries = [];
+  for (const [slot, p] of Object.entries(players)) {
+    if (!p?.uid) continue;
+    const source = p.uid === uid && local ? { ...p, pieces: local.pieces, shieldUntil: local.shieldUntil || p.shieldUntil || 0 } : p;
+    for (const [pieceId, piece] of Object.entries(piecesOf(source))) {
+      if (!piece) continue;
+      entries.push({ slot: String(slot), player: p, pieceId, piece, shieldUntil: Number(source.shieldUntil || 0) });
+    }
+  }
+
+  const liveEvents = roomState.pvpEvents || {};
+  for (const [eventId, ev] of Object.entries(liveEvents)) {
+    if (!ev) continue;
+    const key = `${ev.victimUid}:${ev.victimPieceId}`;
+    hostPvpPendingVictims.set(key, eventId);
+  }
+
+  let emitted = 0;
+  for (let i = 0; i < entries.length && emitted < 3; i++) {
+    for (let j = i + 1; j < entries.length && emitted < 3; j++) {
+      const a = entries[i], b = entries[j];
+      if (a.player.uid === b.player.uid) continue;
+      const dx = a.piece.x - b.piece.x;
+      const dy = a.piece.y - b.piece.y;
+      const d2 = dx * dx + dy * dy;
+      let eater = null, victim = null;
+      if (b.shieldUntil <= nowMs && canConsumeSquared(a.piece.radius, b.piece.radius, d2)) { eater = a; victim = b; }
+      else if (a.shieldUntil <= nowMs && canConsumeSquared(b.piece.radius, a.piece.radius, d2)) { eater = b; victim = a; }
+      if (!eater || !victim) continue;
+
+      const victimKey = `${victim.player.uid}:${victim.pieceId}`;
+      if (hostPvpPendingVictims.has(victimKey)) continue;
+      const eventId = `pvp_${nowMs.toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+      const victimPieceCount = Object.keys(piecesOf(victim.player.uid === uid && local ? local : victim.player)).length;
+      const event = {
+        eaterUid: eater.player.uid,
+        eaterSlot: eater.slot,
+        eaterPieceId: eater.pieceId,
+        victimUid: victim.player.uid,
+        victimSlot: victim.slot,
+        victimPieceId: victim.pieceId,
+        area: Math.round(Math.max(100, victim.piece.radius ** 2 * 0.82)),
+        fullKill: victimPieceCount <= 1,
+        createdAt: nowMs,
+      };
+      hostPvpPendingVictims.set(victimKey, eventId);
+      set(ref(db, `rooms/${roomId}/pvpEvents/${eventId}`), event).catch((err) => {
+        console.warn("PvP event failed", err);
+        hostPvpPendingVictims.delete(victimKey);
+      });
+      emitted++;
+    }
+  }
+}
+
+async function processPvpEvents(events = {}) {
+  if (!roomId || !local || !uid) return;
+  for (const [eventId, event] of Object.entries(events)) {
+    if (!event) continue;
+    const eventRef = ref(db, `rooms/${roomId}/pvpEvents/${eventId}`);
+
+    if (event.victimUid === uid && !event.victimAck && !pvpVictimProcessing.has(eventId)) {
+      pvpVictimProcessing.add(eventId);
+      try {
+        const lost = local.pieces?.[event.victimPieceId];
+        if (!lost) continue;
+        delete local.pieces[event.victimPieceId];
+        const fullyEaten = !Object.keys(local.pieces || {}).length;
+        if (fullyEaten) {
+          const spawn = spawnForSlot(Number(localSlot || 0));
+          local.pieces = { p0: makePiece(spawn.x, spawn.y, START_RADIUS) };
+          local.shieldUntil = Date.now() + 1900;
+          invulnerableUntil = performance.now() + 1900;
+          deathNotice = "A rival ate you! Respawn shield active.";
+        } else {
+          local.shieldUntil = Date.now() + 320;
+          invulnerableUntil = performance.now() + 320;
+          deathNotice = "A rival ate one of your split cells!";
+        }
+        deathNoticeUntil = performance.now() + 1600;
+        syncLocalAggregate();
+        writeLocalNow();
+        await update(eventRef, { victimAck: true, victimAckAt: Date.now() });
+      } catch (err) {
+        console.warn("PvP victim processing failed", err);
+      } finally {
+        pvpVictimProcessing.delete(eventId);
+      }
+    }
+
+    if (event.eaterUid === uid && event.victimAck && !event.eaterAck && !pvpEaterProcessing.has(eventId)) {
+      pvpEaterProcessing.add(eventId);
+      try {
+        let piece = local.pieces?.[event.eaterPieceId];
+        if (!piece) {
+          const fallback = localLargestPieceId();
+          piece = fallback ? local.pieces?.[fallback] : null;
+        }
+        if (piece) {
+          const area = Math.max(100, Math.min(MAX_CELL_RADIUS ** 2, Number(event.area) || 100));
+          piece.radius = Math.min(MAX_CELL_RADIUS, Math.sqrt(piece.radius ** 2 + area));
+          syncLocalAggregate();
+          writeLocalNow();
+          deathNotice = event.fullKill ? "PvP kill! Enemy respawned." : "You ate an enemy split cell!";
+          deathNoticeUntil = performance.now() + 1200;
+        }
+        await update(eventRef, { eaterAck: true, eaterAckAt: Date.now() });
+      } catch (err) {
+        console.warn("PvP eater processing failed", err);
+      } finally {
+        pvpEaterProcessing.delete(eventId);
+      }
+    }
+  }
+}
+
+function hostProcessPvpEventAcks(events = {}) {
+  if (!localHost || !roomId) return;
+  const nowMs = Date.now();
+  for (const [eventId, event] of Object.entries(events)) {
+    if (!event) continue;
+    if (event.fullKill && event.victimAck && !event.killCounted && !countedPvpKillEvents.has(eventId)) {
+      countedPvpKillEvents.add(eventId);
+      const killRef = ref(db, `rooms/${roomId}/stats/pvpKills/${event.eaterUid}`);
+      runTransaction(killRef, (current) => Math.min(100000, Math.max(0, Number(current) || 0) + 1), { applyLocally: false })
+        .then(() => update(ref(db, `rooms/${roomId}/pvpEvents/${eventId}`), { killCounted: true }))
+        .catch((err) => { console.warn("PvP kill counter failed", err); countedPvpKillEvents.delete(eventId); });
+    }
+    if ((event.victimAck && event.eaterAck) || nowMs - Number(event.createdAt || 0) > 9000) {
+      const key = `${event.victimUid}:${event.victimPieceId}`;
+      remove(ref(db, `rooms/${roomId}/pvpEvents/${eventId}`)).catch(console.warn);
+      hostPvpPendingVictims.delete(key);
+      countedPvpKillEvents.delete(eventId);
+    }
+  }
+}
+
 function botFamilyMasses(bots = {}) {
   const families = new Map();
   const source = localHost && hostBots.size ? hostBots.values() : Object.values(bots || {});
@@ -606,11 +781,11 @@ function updateLeaderboard(players = {}, bots = {}) {
   for (const p of Object.values(players).filter(Boolean)) {
     const source = p.uid === uid && local ? { ...p, pieces: local.pieces, x: local.x, y: local.y, radius: local.radius } : p;
     rows.push({
-      name: p.name || "Buddy",
+      name: p.name || "Player",
       mass: playerMass(source),
       type: "player",
       self: p.uid === uid,
-      partner: p.uid !== uid,
+      partner: false,
     });
   }
 
@@ -622,7 +797,7 @@ function updateLeaderboard(players = {}, bots = {}) {
   leaderboardList.textContent = "";
   rows.slice(0, 10).forEach((row, index) => {
     const line = document.createElement("div");
-    line.className = `leaderboard-row ${row.type}${row.self ? " self" : ""}${row.partner ? " partner" : ""}`;
+    line.className = `leaderboard-row ${row.type}${row.self ? " self" : ""}`;
 
     const rank = document.createElement("span");
     rank.className = "leaderboard-rank";
@@ -630,7 +805,7 @@ function updateLeaderboard(players = {}, bots = {}) {
 
     const name = document.createElement("span");
     name.className = "leaderboard-name";
-    name.textContent = `${row.name}${row.self ? " · YOU" : row.partner ? " · CO-OP" : ""}`;
+    name.textContent = `${row.name}${row.self ? " · YOU" : ""}`;
 
     const mass = document.createElement("span");
     mass.className = "leaderboard-mass";
@@ -642,7 +817,9 @@ function updateLeaderboard(players = {}, bots = {}) {
 }
 
 function updateHud(players, bots = {}) {
-  const mass = teamMass(players);
+  const selfRemote = Object.values(players).find((p) => p?.uid === uid);
+  const selfSource = selfRemote && local ? { ...selfRemote, pieces: local.pieces, x: local.x, y: local.y, radius: local.radius } : selfRemote;
+  const myMass = selfSource ? playerMass(selfSource) : 0;
   const liveBotFamilies = new Set();
   for (const b of Object.values(bots)) {
     if (!b || b.eatenBy) continue;
@@ -650,11 +827,11 @@ function updateHud(players, bots = {}) {
     if (String(family).startsWith("bot")) liveBotFamilies.add(family);
   }
   if (botsCountEl) botsCountEl.textContent = String(liveBotFamilies.size);
-  scoreEl.textContent = String(mass);
-  progressBar.style.width = `${Math.min(100, (mass / TEAM_GOAL) * 100)}%`;
+  scoreEl.textContent = String(myMass);
 
   playersList.textContent = "";
   Object.entries(players).forEach(([, p]) => {
+    if (!p) return;
     const line = document.createElement("div");
     line.className = "player-line";
     const dot = document.createElement("span");
@@ -664,8 +841,9 @@ function updateHud(players, bots = {}) {
     const source = p.uid === uid && local ? { ...p, pieces: local.pieces, x: local.x, y: local.y, radius: local.radius } : p;
     const cells = Object.keys(piecesOf(source)).length;
     const size = playerMass(source);
-    const kills = playerKillCount(p.uid);
-    text.textContent = `${p.name || "Buddy"}${p.uid === uid ? " (you)" : ""} · SIZE ${size} · KILLS ${kills} · ${cells} cell${cells === 1 ? "" : "s"}`;
+    const botKills = playerKillCount(p.uid);
+    const pvpKills = playerPvpKillCount(p.uid);
+    text.textContent = `${p.name || "Player"}${p.uid === uid ? " (you)" : ""} · SIZE ${size} · PvP ${pvpKills} · Bot ${botKills} · ${cells} cell${cells === 1 ? "" : "s"}`;
     line.append(dot, text);
     playersList.append(line);
   });
@@ -673,20 +851,13 @@ function updateHud(players, bots = {}) {
   updateLeaderboard(players, bots);
 
   const count = Object.keys(players).length;
-  if (transferBtn) {
-    transferBtn.disabled = count < 2;
-    transferBtn.title = count < 2 ? "Your buddy can join anytime; mass transfer unlocks when they arrive." : "Transfer mass to your co-op partner";
-  }
-  if (count < 2) {
+  if (count < 3) {
     const waiting = document.createElement("div");
     waiting.className = "player-line waiting-line";
-    waiting.textContent = "Solo mode · buddy can join anytime";
+    waiting.textContent = `FFA active · ${3 - count} open player slot${3 - count === 1 ? "" : "s"}`;
     playersList.append(waiting);
   }
-  if (mass >= TEAM_GOAL) {
-    won = true;
-    showBanner("Team goal reached! 🎉\nKeep eating or start a new room.");
-  } else if (!won) hideBanner();
+  hideBanner();
 }
 
 function showBanner(text) {
@@ -725,82 +896,6 @@ function currentAim() {
   return { x: dx / dist, y: dy / dist, intensity: Math.min(dist / 180, 1) };
 }
 
-function transferMassToPartner() {
-  if (!roomId || !local || !db) return;
-  const now = performance.now();
-  if (now - lastMassTransferAt < TRANSFER_COOLDOWN_MS) return;
-  const partner = Object.values(roomState?.players || {}).find((p) => p?.uid && p.uid !== uid);
-  if (!partner) return;
-
-  const entries = Object.entries(local.pieces || {}).sort((a, b) => b[1].radius - a[1].radius);
-  const target = entries[0];
-  if (!target) return;
-  const [pieceId, piece] = target;
-  const totalArea = aggregatePieces(local.pieces).area;
-  const availableArea = Math.max(0, piece.radius ** 2 - TRANSFER_MIN_REMAINING_SIZE * 100);
-  const desiredSize = Math.max(TRANSFER_MIN_SIZE, Math.min(TRANSFER_MAX_SIZE, (totalArea / 100) * TRANSFER_FRACTION));
-  const transferArea = Math.min(availableArea, desiredSize * 100);
-  if (transferArea < TRANSFER_MIN_SIZE * 100) {
-    deathNotice = `Need at least ${TRANSFER_MIN_REMAINING_SIZE + TRANSFER_MIN_SIZE} size to transfer mass.`;
-    deathNoticeUntil = performance.now() + 1400;
-    return;
-  }
-
-  const transferId = `${uid.slice(0, 8)}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
-  const payload = {
-    fromUid: uid,
-    toUid: partner.uid,
-    area: Math.round(transferArea),
-    createdAt: Date.now(),
-  };
-
-  lastMassTransferAt = now;
-  set(ref(db, `rooms/${roomId}/transfers/${transferId}`), payload).then(() => {
-    const livePiece = local?.pieces?.[pieceId];
-    if (!livePiece) return;
-    livePiece.radius = Math.max(10, Math.sqrt(Math.max(100, livePiece.radius ** 2 - transferArea)));
-    syncLocalAggregate();
-    writeLocalNow();
-    deathNotice = `Sent ${Math.round(transferArea / 100)} mass to ${partner.name || "your buddy"}.`;
-    deathNoticeUntil = performance.now() + 1300;
-  }).catch((err) => {
-    console.warn("Mass transfer failed", err);
-    deathNotice = friendlyError(err);
-    deathNoticeUntil = performance.now() + 1800;
-  });
-}
-
-async function processIncomingTransfers(transfers = {}) {
-  if (!roomId || !local || !uid) return;
-  for (const [transferId, transfer] of Object.entries(transfers)) {
-    if (!transfer || transfer.toUid !== uid || transferProcessing.has(transferId)) continue;
-    const area = Number(transfer.area);
-    if (!Number.isFinite(area) || area <= 0) continue;
-    transferProcessing.add(transferId);
-    try {
-      const transferRef = ref(db, `rooms/${roomId}/transfers/${transferId}`);
-      const result = await runTransaction(transferRef, (current) => {
-        if (!current || current.toUid !== uid) return;
-        return null;
-      }, { applyLocally: false });
-      if (!result.committed) continue;
-
-      const largest = Object.entries(local.pieces || {}).sort((a, b) => b[1].radius - a[1].radius)[0];
-      if (!largest) continue;
-      const piece = largest[1];
-      piece.radius = Math.min(MAX_CELL_RADIUS, Math.sqrt(piece.radius ** 2 + area));
-      syncLocalAggregate();
-      writeLocalNow();
-      const sender = Object.values(roomState?.players || {}).find((p) => p?.uid === transfer.fromUid);
-      deathNotice = `+${Math.round(area / 100)} mass from ${sender?.name || "your buddy"}!`;
-      deathNoticeUntil = performance.now() + 1400;
-    } catch (err) {
-      console.warn("Incoming mass transfer failed", err);
-    } finally {
-      transferProcessing.delete(transferId);
-    }
-  }
-}
 
 function splitLocalPlayer() {
   if (!roomId || !local) return;
@@ -1118,11 +1213,12 @@ function eatenByBot(pieceId, botId, bot) {
 
   const fullyEaten = !Object.keys(local.pieces).length;
   if (fullyEaten) {
-    const x = Math.max(80, Math.min(WORLD.width - 80, WORLD.width / 2 + (localSlot ? 180 : -180) + (Math.random() - 0.5) * 280));
-    const y = Math.max(80, Math.min(WORLD.height - 80, WORLD.height / 2 + (Math.random() - 0.5) * 280));
-    local.pieces = { p0: makePiece(x, y, START_RADIUS) };
+    const spawn = spawnForSlot(Number(localSlot || 0));
+    local.pieces = { p0: makePiece(spawn.x, spawn.y, START_RADIUS) };
+    local.shieldUntil = Date.now() + 1900;
     deathNotice = `${bot.name || "Enemy"} ate you! Respawn shield active.`;
   } else {
+    local.shieldUntil = Date.now() + 280;
     deathNotice = `${bot.name || "Enemy"} ate one of your split cells!`;
   }
 
@@ -1252,7 +1348,7 @@ function allPlayerTargets() {
   const targets = [];
   for (const p of Object.values(roomState?.players || {}).filter(Boolean)) {
     const source = p.uid === uid && local ? local : p;
-    const kills = playerKillCount(p.uid);
+    const kills = playerThreatKillCount(p.uid);
     for (const [pieceId, piece] of Object.entries(piecesOf(source))) {
       targets.push({ ...piece, ownerUid: p.uid, pieceId, kills });
     }
@@ -1406,7 +1502,7 @@ function tickBots(dt, now) {
     let botPrey = null;
     let botPreyDist = Infinity;
 
-    // Reputation/fear: normal bots remember the team's recent bot kills through
+    // Reputation/fear: normal bots remember each player's recent kill reputation through
     // the host-owned room counter. The more dangerous a player has proven to be,
     // the earlier ordinary bots start giving them space. Dedicated Hunters stay
     // aggressive, while Cannibals mainly care about eating other bot families.
@@ -1470,7 +1566,7 @@ function tickBots(dt, now) {
         splitBot(botId, bot, dirX, dirY);
       }
     } else if (personality === "hunter" && playerPrey) {
-      // Hunter bots prioritize the human team and deliberately split-attack.
+      // Hunter bots prioritize human players and deliberately split-attack.
       dirX = playerPrey.x - bot.x;
       dirY = playerPrey.y - bot.y;
       if (playerPreyDist > bot.radius * 1.4 && playerPreyDist < 470 && bot.radius > playerPrey.radius * 1.43) {
@@ -1800,7 +1896,10 @@ function drawPlayers(cam) {
       ctx.strokeStyle = "rgba(255,255,255,.6)";
       ctx.stroke();
 
-      if (p.uid === uid && performance.now() < invulnerableUntil) {
+      const shielded = p.uid === uid
+        ? (performance.now() < invulnerableUntil || Number(local?.shieldUntil || 0) > Date.now())
+        : Number(p.shieldUntil || 0) > Date.now();
+      if (shielded) {
         ctx.beginPath();
         ctx.arc(x, y, r + 8, 0, Math.PI * 2);
         ctx.setLineDash([7, 6]);
@@ -1815,71 +1914,12 @@ function drawPlayers(cam) {
       ctx.textAlign = "center";
       ctx.textBaseline = "middle";
       ctx.fillStyle = "rgba(8,12,25,.82)";
-      ctx.fillText(p.name || "Buddy", x, y);
+      ctx.fillText(p.name || "Player", x, y);
       ctx.restore();
     }
   }
 }
 
-function coopPartnerInfo() {
-  const players = Object.values(roomState?.players || {}).filter(Boolean);
-  const partner = players.find((p) => p.uid !== uid);
-  if (!partner) return null;
-  const aggregate = aggregatePieces(piecesOf(partner));
-  return { player: partner, aggregate };
-}
-
-function drawCoopPartnerArrow(cam) {
-  if (!roomId || !local) return;
-  const info = coopPartnerInfo();
-  if (!info) return;
-
-  const screenX = info.aggregate.x - cam.x;
-  const screenY = info.aggregate.y - cam.y;
-  const pad = Math.max(18, info.aggregate.radius);
-  const onScreen = screenX >= -pad && screenX <= innerWidth + pad && screenY >= -pad && screenY <= innerHeight + pad;
-  if (onScreen) return;
-
-  const cx = innerWidth / 2;
-  const cy = innerHeight / 2;
-  const dx = screenX - cx;
-  const dy = screenY - cy;
-  const dist = Math.hypot(dx, dy) || 1;
-  const ux = dx / dist;
-  const uy = dy / dist;
-
-  const insetX = Math.max(38, innerWidth / 2 - 44);
-  const insetY = Math.max(38, innerHeight / 2 - 54);
-  const tx = Math.abs(ux) > 0.0001 ? insetX / Math.abs(ux) : Infinity;
-  const ty = Math.abs(uy) > 0.0001 ? insetY / Math.abs(uy) : Infinity;
-  const edge = Math.min(tx, ty);
-  let x = cx + ux * edge;
-  let y = cy + uy * edge;
-
-  // Keep the indicator clear of the top-right leaderboard.
-  if (x > innerWidth - 230 && y < 250) y = 258;
-  x = Math.max(32, Math.min(innerWidth - 32, x));
-  y = Math.max(42, Math.min(innerHeight - 42, y));
-
-  ctx.save();
-  ctx.translate(x, y);
-  ctx.rotate(Math.atan2(uy, ux));
-  ctx.shadowColor = info.player.color || "#72e7ff";
-  ctx.shadowBlur = 10;
-  ctx.beginPath();
-  ctx.moveTo(14, 0);
-  ctx.lineTo(-8, -9);
-  ctx.lineTo(-4, 0);
-  ctx.lineTo(-8, 9);
-  ctx.closePath();
-  ctx.fillStyle = info.player.color || "#72e7ff";
-  ctx.fill();
-  ctx.shadowBlur = 0;
-  ctx.lineWidth = 2;
-  ctx.strokeStyle = "rgba(255,255,255,.82)";
-  ctx.stroke();
-  ctx.restore();
-}
 
 function drawDeathNotice(now) {
   if (!deathNotice || now >= deathNoticeUntil) return;
@@ -1920,6 +1960,7 @@ function frame(now) {
     const botDt = lastBotSimAt ? Math.min(0.06, (now - lastBotSimAt) / 1000) : dt;
     lastBotSimAt = now;
     tickBots(botDt, now);
+    hostResolvePvp(Date.now());
   }
   hostMaintenance(now);
   smoothPlayerPieces(dt);
@@ -1930,7 +1971,6 @@ function frame(now) {
   drawFood(cam);
   drawBots(cam);
   drawPlayers(cam);
-  drawCoopPartnerArrow(cam);
   drawDirection();
   drawDeathNotice(now);
   requestAnimationFrame(frame);
@@ -1940,7 +1980,6 @@ createBtn.addEventListener("click", createRoom);
 joinBtn.addEventListener("click", joinRoom);
 leaveBtn.addEventListener("click", () => leaveRoom(true));
 splitBtn?.addEventListener("click", (e) => { e.preventDefault(); splitLocalPlayer(); });
-transferBtn?.addEventListener("click", (e) => { e.preventDefault(); transferMassToPartner(); });
 copyBtn.addEventListener("click", async () => {
   if (!roomId) return;
   try {
@@ -1961,9 +2000,6 @@ window.addEventListener("keydown", (e) => {
   if (e.code === "Space") {
     e.preventDefault();
     if (!e.repeat) splitLocalPlayer();
-  } else if (e.code === "KeyW") {
-    e.preventDefault();
-    if (!e.repeat) transferMassToPartner();
   }
 });
 window.addEventListener("resize", resizeCanvas);

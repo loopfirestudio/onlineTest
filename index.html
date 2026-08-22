@@ -4,17 +4,17 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <meta name="theme-color" content="#0b1020" />
-  <title>Blob Buddies — 2 Player Co-op</title>
+  <title>Blob Royale — 3 Player PvPvE</title>
   <link rel="stylesheet" href="./style.css" />
 </head>
 <body>
-  <canvas id="game" aria-label="Blob Buddies game canvas"></canvas>
+  <canvas id="game" aria-label="Blob Royale game canvas"></canvas>
 
   <main id="menu" class="panel-shell">
     <section class="panel">
-      <div class="eyebrow">SOLO + 2 PLAYER CO-OP</div>
-      <h1>Blob Buddies</h1>
-      <p class="lead">An Agar.io-inspired browser game you can play solo immediately, then seamlessly continue in co-op when a buddy joins.</p>
+      <div class="eyebrow">1–3 PLAYER PvPvE · FREE FOR ALL</div>
+      <h1>Blob Royale</h1>
+      <p class="lead">Agar.io-style free-for-all: fight up to two other players while 30 autonomous bot families hunt, flee, split and eat each other around you.</p>
       <div id="buildVersion" style="font-size:11px;opacity:.55;margin-top:-4px;margin-bottom:14px"></div>
 
       <label>
@@ -22,7 +22,7 @@
         <input id="nameInput" maxlength="18" autocomplete="nickname" placeholder="Blobber" />
       </label>
 
-      <button id="createBtn" class="primary">Create room</button>
+      <button id="createBtn" class="primary">Create FFA room</button>
 
       <div class="divider"><span>or</span></div>
 
@@ -36,8 +36,8 @@
 
       <p id="menuStatus" class="status" role="status"></p>
       <details>
-        <summary>Controls</summary>
-        <p>Move with your mouse or finger. Press <strong>Space</strong> or tap <strong>SPLIT</strong> to split toward your aim. You can start playing immediately after creating a room; your buddy may join later with the room code. Once they arrive, press <strong>W</strong> or tap <strong>TRANSFER</strong> to donate mass. Eat pellets and smaller enemies and reach 5000 team mass. The arena is 5000×4000.</p>
+        <summary>Controls & rules</summary>
+        <p>Move with your mouse or finger. Press <strong>Space</strong> or tap <strong>SPLIT</strong> to split toward your aim. You may start alone; Player 2 and Player 3 can join later. Bigger player cells can eat smaller rival cells, and bots can eat players too. Full PvP deaths respawn at starting size with a short shield. The arena is 5000×4000.</p>
       </details>
     </section>
   </main>
@@ -49,29 +49,28 @@
       <button id="copyBtn" class="mini">Copy</button>
     </div>
     <div class="hud-card score-card">
-      <span class="hud-label">TEAM MASS</span>
-      <strong><span id="score">0</span> / <span id="goal">5000</span></strong>
-      <div class="progress"><i id="progressBar"></i></div>
+      <span class="hud-label">YOUR MASS</span>
+      <strong id="score">0</strong>
+      <div class="mode-line">3 PLAYER FFA · PvP + PvE</div>
     </div>
     <div class="hud-card players-card">
-      <span class="hud-label">BUDDIES · CURRENT SIZE</span>
+      <span class="hud-label">PLAYERS · SIZE · KILLS</span>
       <div id="playersList"></div>
     </div>
     <div class="hud-card enemies-card">
-      <span class="hud-label">ENEMIES</span>
-      <strong><span id="botsCount">30</span> BOTS</strong>
+      <span class="hud-label">PvE</span>
+      <strong><span id="botsCount">30</span> BOT FAMILIES</strong>
     </div>
   </section>
 
   <aside id="leaderboard" class="leaderboard hidden" aria-label="Top ten leaderboard">
-    <div class="leaderboard-title">TOP 10</div>
+    <div class="leaderboard-title">TOP 10 · MASS</div>
     <div id="leaderboardList" class="leaderboard-list"></div>
   </aside>
 
   <div id="banner" class="banner hidden"></div>
 
   <div class="action-buttons">
-    <button id="transferBtn" class="transfer hidden" aria-label="Transfer mass to your co-op partner">TRANSFER <span>W</span></button>
     <button id="splitBtn" class="split hidden" aria-label="Split your cells">SPLIT <span>SPACE</span></button>
   </div>
 

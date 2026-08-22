@@ -1,30 +1,51 @@
-# Blob Buddies — Build 1.8.3 Cannibal + Fear
+# Blob Royale — Build 2.0.0 FFA3
 
-## New in 1.8.3
+A browser-based Agar.io-inspired **1–3 player PvPvE free-for-all** using Firebase Realtime Database.
 
-- Added **Cannibal bots**. Six of the 30 regular bot families use the new Cannibal personality. They actively search a wide area for smaller enemy bot families, split-attack good targets, and keep extra mass from bot-on-bot kills. This lets a normal-looking bot naturally snowball into a giant threat without any boss system.
-- Added a **Fear / reputation system**. Every bot cell a player eats increases that player's room kill count. Rival, Chaos, and Dumb bots become progressively more cautious as a player's kill count rises: they detect that player from farther away, flee sooner, and require a larger size advantage before willingly approaching as a predator.
-- **Hunter bots ignore reputation fear** and remain aggressive toward players, so high kill counts do not make the entire map passive.
-- Player kill counts are shown in the top player HUD as `KILLS`.
-- Kill reputation is stored under the room's host-authoritative `stats/playerKills` data, so both players have separate reputations and the count survives host migration during the room.
+## Core mode
 
-## Existing gameplay retained
+- Up to **3 human players** in one room.
+- The host can start playing immediately; Player 2 and Player 3 can join the running room later.
+- **Everyone fights everyone**: larger player cells can eat smaller rival player cells.
+- A full PvP death respawns that player at starting size with a short visible shield.
+- Split cells can be eaten individually without killing the whole player.
+- PvP kills are tracked separately from bot kills.
+- Top-10 leaderboard ranks humans and bot families by current mass.
 
-- 5000×4000 map
-- 30 regular bot families
-- Host can play immediately before Player 2 joins
-- 5000 team goal
-- Maximum displayed cell size 10,000
-- Player and bot splitting/merging
-- Mass transfer between co-op partners
-- Hunter / Rival / Chaos / Dumb personalities plus the new Cannibal personality
-- Top-10 leaderboard
-- Off-screen co-op partner arrow
-- Performance optimizations from the 1.8.x builds
-- No boss enemies
+## PvE retained
 
-## Firebase update required
+- 5000×4000 arena.
+- 30 bot families.
+- Hunter / Rival / Chaos / Dumb / Cannibal bot personalities.
+- Cannibal bots actively eat other bot families and can naturally snowball into giant threats.
+- Fear/reputation system: non-Hunter bots become more cautious around players with many total kills.
+- Bots eat pellets, players and other bots, split, grow and merge.
 
-This build adds `stats/playerKills`, so publish the included `database.rules.json` in Firebase Realtime Database before testing.
+## Player systems retained
 
-After publishing the rules, hard-refresh both browsers and create a new room so the new bot personality distribution is present immediately.
+- Mouse/touch movement.
+- `Space` / SPLIT button to split.
+- Up to 4 player cells.
+- Automatic merge cooldown.
+- Maximum displayed cell size: 10,000.
+- 400 pellets with spatial-grid collision optimization.
+- Canvas LOD/performance optimizations for very large cells.
+
+## Removed co-op-only systems
+
+Because this is now a true FFA, the old team-goal, mass-transfer and co-op-partner arrow systems are removed.
+
+## Same-PC testing
+
+Authentication uses **in-memory anonymous Firebase persistence**, so separate browser tabs receive separate anonymous UIDs. This allows testing Player 1, Player 2 and Player 3 in three tabs on one PC.
+
+## Firebase setup
+
+1. Keep Anonymous Authentication enabled.
+2. Open Firebase Console → Realtime Database → Rules.
+3. Replace the currently published rules completely with this build's `database.rules.json`.
+4. Publish the rules.
+5. Serve the folder from Firebase Hosting or another HTTP server.
+6. Create a fresh room after deploying the rules.
+
+The included ruleset is dedicated to this Agar.io FFA project and uses `/rooms`.
