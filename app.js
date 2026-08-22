@@ -1,5 +1,5 @@
 // Blob Royale — Agar.io-inspired 3-player PvPvE free-for-all with synchronized bots and splitting.
-// Build 2.0.2 fixes remote bot stutter with compact 8 Hz snapshots + client dead reckoning.
+// Build 2.0.3 restores reliable client bot synchronization and adds safe render-side prediction.
 // Firebase Web SDK 12.17.1 via Google's CDN.
 
 import { initializeApp } from "https://www.gstatic.com/firebasejs/12.17.1/firebase-app.js";
@@ -30,7 +30,7 @@ const firebaseConfig = {
   appId: "1:257019969127:web:0a910b0fe08fde4d60dec2",
 };
 
-const BUILD_VERSION = "2.0.2-smooth-bots";
+const BUILD_VERSION = "2.0.3-clientfix";
 const WORLD = { width: 5000, height: 4000 };
 const FOOD_TARGET = 400;
 const START_RADIUS = 30;
@@ -55,8 +55,8 @@ const BOT_MERGE_MS = 7000;
 // stays at requestAnimationFrame speed while host AI is capped near 25 Hz.
 const BOT_SIM_INTERVAL_MS = 50; // 20 Hz authoritative AI; render remains requestAnimationFrame
 const PLAYER_NETWORK_INTERVAL_MS = 90; // ~11 Hz player sync with interpolation
-const BOT_NETWORK_INTERVAL_MS = 125; // 8 Hz compact bot snapshots; clients dead-reckon between updates
-const BOT_STATE_NETWORK_INTERVAL_MS = 800; // slow-changing host-migration AI state is synced separately
+const BOT_NETWORK_INTERVAL_MS = 100; // 10 Hz reliable bot snapshots; clients smooth/predict locally
+const BOT_STATE_NETWORK_INTERVAL_MS = 750; // slow-changing AI state is synced separately
 const LARGE_CELL_LOD_RADIUS = 180;
 const MAX_CONCURRENT_FOOD_CLAIMS = 10;
 const MAX_NEW_FOOD_CLAIMS_PER_TICK = 3;
@@ -124,7 +124,9 @@ let connectedUnsubscribe = null;
 let roomMetaLoaded = false;
 let roomPlayersLoaded = false;
 let roomState = null;
-let remoteBotEntries = new Map();
+let remoteBotEntries = [];
+let remoteBotMotion = new Map();
+let lastBotSnapshotAt = 0;
 let local = null;
 let localSlot = null;
 let localHost = false;
@@ -133,7 +135,6 @@ let hostLoopAt = 0;
 let hostMaintenanceReadyAt = 0;
 let lastBotNetworkWrite = 0;
 let lastBotStateNetworkWrite = 0;
-let botNetworkWriteInFlight = false;
 let lastBotSimAt = 0;
 let eating = new Set();
 let botEating = new Set();
@@ -455,9 +456,10 @@ async function enterRoom(code, player, slot) {
   lastBotSimAt = 0;
   lastBotNetworkWrite = 0;
   lastBotStateNetworkWrite = 0;
-  botNetworkWriteInFlight = false;
   renderPlayerPieces.clear();
   renderBots.clear();
+  remoteBotMotion.clear();
+  lastBotSnapshotAt = 0;
   hostBots.clear();
   roomCodeEl.textContent = code;
   menu.classList.add("hidden");
@@ -500,7 +502,6 @@ async function enterRoom(code, player, slot) {
       lastBotSimAt = 0;
       lastBotNetworkWrite = 0;
       lastBotStateNetworkWrite = 0;
-      botNetworkWriteInFlight = false;
       remoteBotsDirty = true;
       botMealsDirty = true;
       statsDirty = true;
@@ -558,59 +559,79 @@ async function enterRoom(code, player, slot) {
     foodGridSource = roomState.food;
   }));
 
-  const botsRef = ref(db, `rooms/${roomId}/bots`);
-  const onBotUpsert = (snap) => {
-    if (!snap.key) return;
-    const next = snap.val();
-    if (!next) return;
-    const prev = roomState.bots[snap.key];
-
-    // Host optimization: ordinary movement echoes are already represented by
-    // hostBots. Keep only the Firebase mirror current and skip prediction work.
-    if (localHost && prev && prev?.eatenBy === next.eatenBy && hostBots.has(snap.key)) {
-      roomState.bots[snap.key] = next;
-      return;
-    }
-
+  roomUnsubs.push(onValue(ref(db, `rooms/${roomId}/bots`), (snap) => {
     const recvAt = performance.now();
+    const previousBots = roomState.bots || {};
+    const nextBots = snap.val() || {};
+    const nextEntries = Object.entries(nextBots);
+    const seen = new Set();
 
-    // Client-side dead reckoning: measure actual world velocity between Firebase
-    // snapshots. This includes flee boosts and split boosts, so it is more accurate
-    // than trying to reconstruct AI decisions on a non-host client.
-    let netVelX = Number(prev?._netVelX || 0);
-    let netVelY = Number(prev?._netVelY || 0);
-    const prevAt = Number(prev?._recvAt || 0);
-    if (prev && prevAt > 0) {
-      const sampleDt = (recvAt - prevAt) / 1000;
-      if (sampleDt >= 0.035 && sampleDt <= 1.6) {
-        let sx = (Number(next.x || 0) - Number(prev.x || 0)) / sampleDt;
-        let sy = (Number(next.y || 0) - Number(prev.y || 0)) / sampleDt;
-        const speed = Math.hypot(sx, sy);
-        const maxSampleSpeed = 1450;
-        if (speed > maxSampleSpeed) { const k = maxSampleSpeed / speed; sx *= k; sy *= k; }
-        const blend = sampleDt > 0.45 ? 0.82 : 0.58;
-        netVelX += (sx - netVelX) * blend;
-        netVelY += (sy - netVelY) * blend;
+    // Keep networking and rendering separate. Firebase remains the authoritative
+    // snapshot source, while this tiny motion cache is only used for visual
+    // interpolation/dead-reckoning on non-host clients.
+    if (!localHost) {
+      for (const [id, bot] of nextEntries) {
+        if (!bot) continue;
+        seen.add(id);
+        const prevTrack = remoteBotMotion.get(id);
+        let vx = prevTrack?.vx || 0;
+        let vy = prevTrack?.vy || 0;
+        if (prevTrack) {
+          const sampleDt = (recvAt - prevTrack.recvAt) / 1000;
+          if (sampleDt >= 0.035 && sampleDt <= 1.5) {
+            let sx = (Number(bot.x || 0) - prevTrack.netX) / sampleDt;
+            let sy = (Number(bot.y || 0) - prevTrack.netY) / sampleDt;
+            const speedSq = sx * sx + sy * sy;
+            const maxSpeed = 1450;
+            if (speedSq > maxSpeed * maxSpeed) {
+              const scale = maxSpeed / Math.sqrt(speedSq);
+              sx *= scale; sy *= scale;
+            }
+            // Blend samples instead of trusting one jittery network interval.
+            const blend = sampleDt > 0.45 ? 0.78 : 0.56;
+            vx += (sx - vx) * blend;
+            vy += (sy - vy) * blend;
+          }
+        }
+        remoteBotMotion.set(id, {
+          netX: Number(bot.x || 0),
+          netY: Number(bot.y || 0),
+          recvAt,
+          vx,
+          vy,
+        });
+      }
+      for (const id of remoteBotMotion.keys()) {
+        if (!seen.has(id)) {
+          remoteBotMotion.delete(id);
+          renderBots.delete(id);
+        }
       }
     }
 
-    const item = { ...next, _recvAt: recvAt, _netVelX: netVelX, _netVelY: netVelY };
-    roomState.bots[snap.key] = item;
-    remoteBotEntries.set(snap.key, item);
+    roomState.bots = nextBots;
+    remoteBotEntries = nextEntries;
+    lastBotSnapshotAt = recvAt;
 
-    // The host already owns authoritative movement in hostBots. Do not make its
-    // own 8 Hz movement echoes force a full hostBots reconciliation. We only need
-    // reconciliation for additions or client claims (eatenBy changes).
-    if (!localHost || !prev || prev?.eatenBy !== item.eatenBy || !hostBots.has(snap.key)) remoteBotsDirty = true;
-  };
-  roomUnsubs.push(onChildAdded(botsRef, onBotUpsert));
-  roomUnsubs.push(onChildChanged(botsRef, onBotUpsert));
-  roomUnsubs.push(onChildRemoved(botsRef, (snap) => {
-    if (!snap.key) return;
-    delete roomState.bots[snap.key];
-    remoteBotEntries.delete(snap.key);
-    renderBots.delete(snap.key);
-    remoteBotsDirty = true;
+    // On clients this flag is irrelevant. On the host, avoid reconciling the
+    // authoritative simulation for every position echo. Reconcile only if the
+    // structure/eatenBy state changed (client claim, split spawn, deletion, etc.).
+    if (!localHost) {
+      remoteBotsDirty = true;
+    } else {
+      const previousIds = Object.keys(previousBots);
+      const nextIds = Object.keys(nextBots);
+      let structuralChange = previousIds.length !== nextIds.length;
+      if (!structuralChange) {
+        for (const id of nextIds) {
+          if (!previousBots[id] || previousBots[id]?.eatenBy !== nextBots[id]?.eatenBy) {
+            structuralChange = true;
+            break;
+          }
+        }
+      }
+      if (structuralChange) remoteBotsDirty = true;
+    }
   }));
 
   roomUnsubs.push(onValue(ref(db, `rooms/${roomId}/stats`), (snap) => {
@@ -666,7 +687,9 @@ async function leaveRoom(removeSelf = true) {
 
   roomId = null;
   roomState = null;
-  remoteBotEntries = new Map();
+  remoteBotEntries = [];
+  remoteBotMotion.clear();
+  lastBotSnapshotAt = 0;
   local = null;
   localSlot = null;
   localHost = false;
@@ -1305,7 +1328,7 @@ async function claimFood(foodId, food, pieceId) {
 
 function checkBotCollisions() {
   if (!local) return;
-  const botEntries = localHost ? hostBots.entries() : remoteBotEntries.entries();
+  const botEntries = localHost ? hostBots.entries() : remoteBotEntries;
   const pieceEntries = Object.entries(local.pieces || {});
   const protectedFromBots = performance.now() < invulnerableUntil;
   let consumedThisTick = 0;
@@ -1946,38 +1969,29 @@ function tickBots(dt, now) {
 
   ensureBotFamilies();
 
-  if (!botNetworkWriteInFlight && now - lastBotNetworkWrite > BOT_NETWORK_INTERVAL_MS) {
+  if (now - lastBotNetworkWrite > BOT_NETWORK_INTERVAL_MS) {
     lastBotNetworkWrite = now;
     const syncFullState = now - lastBotStateNetworkWrite > BOT_STATE_NETWORK_INTERVAL_MS;
     if (syncFullState) lastBotStateNetworkWrite = now;
     const patch = {};
     for (const [id, bot] of hostBots) {
       if (botRemoving.has(id)) continue;
-      // Compact visual snapshot. Velocity/boost travel with every position sample
-      // so clients have enough information to keep moving through network jitter.
+      // Hot path: clients only need position + size for rendering/collisions.
       patch[`bots/${id}/x`] = Math.round(bot.x * 10) / 10;
       patch[`bots/${id}/y`] = Math.round(bot.y * 10) / 10;
       patch[`bots/${id}/radius`] = Math.round(bot.radius * 100) / 100;
-      patch[`bots/${id}/vx`] = Math.round(bot.vx * 100) / 100;
-      patch[`bots/${id}/vy`] = Math.round(bot.vy * 100) / 100;
-      patch[`bots/${id}/boostX`] = Math.round((bot.boostX || 0) * 10) / 10;
-      patch[`bots/${id}/boostY`] = Math.round((bot.boostY || 0) * 10) / 10;
-      // Host migration timers are less time-sensitive.
+      // Host migration state is much less time-sensitive, so sync it ~1 Hz.
       if (syncFullState) {
+        patch[`bots/${id}/vx`] = Math.round(bot.vx * 1000) / 1000;
+        patch[`bots/${id}/vy`] = Math.round(bot.vy * 1000) / 1000;
+        patch[`bots/${id}/boostX`] = Math.round((bot.boostX || 0) * 10) / 10;
+        patch[`bots/${id}/boostY`] = Math.round((bot.boostY || 0) * 10) / 10;
         patch[`bots/${id}/turnAt`] = Math.round(bot.turnAt || 0);
         patch[`bots/${id}/mergeAt`] = Math.round(bot.mergeAt || 0);
         patch[`bots/${id}/splitReadyAt`] = Math.round(bot.splitReadyAt || 0);
       }
     }
-    if (Object.keys(patch).length) {
-      // Never queue stale movement snapshots behind a slow network. If Firebase is
-      // still acknowledging the previous frame, the simulator simply keeps going
-      // and the next write contains the newest positions.
-      botNetworkWriteInFlight = true;
-      update(ref(db, `rooms/${roomId}`), patch)
-        .catch(console.warn)
-        .finally(() => { botNetworkWriteInFlight = false; });
-    }
+    if (Object.keys(patch).length) update(ref(db, `rooms/${roomId}`), patch).catch(console.warn);
   }
 }
 
@@ -2080,61 +2094,62 @@ function smoothPlayerPieces(dt) {
 
 function smoothBots(dt, nowPerf = performance.now()) {
   const seenId = ++renderBotSeenId;
-  const sourceEntries = localHost ? hostBots.entries() : remoteBotEntries.entries();
+  const sourceEntries = localHost ? hostBots.entries() : remoteBotEntries;
+  const normalT = 1 - Math.exp(-14 * dt);
+  const catchupT = 1 - Math.exp(-24 * dt);
+  const radiusT = 1 - Math.exp(-16 * dt);
 
-  // Fast correction for fresh snapshots, softer correction while dead-reckoning.
-  // A short prediction horizon prevents visible freezes during normal RTDB jitter.
   for (const [id, remote] of sourceEntries) {
     if (!remote || remote.eatenBy) continue;
-
     let targetX = Number(remote.x || 0);
     let targetY = Number(remote.y || 0);
+
     if (!localHost) {
-      const ageMs = Math.max(0, nowPerf - Number(remote._recvAt || nowPerf));
-      // Predict at full measured velocity for ordinary jitter. During a longer
-      // network stall the bot keeps coasting, but with a bounded extra horizon so
-      // it cannot drift across the whole map on a lost connection. The predicted
-      // distance is monotonic, preventing any backwards correction before a real
-      // snapshot arrives.
-      const fastMs = Math.min(ageMs, 900);
-      const slowExtraMs = ageMs > 900 ? Math.min(400, (ageMs - 900) * 0.5) : 0;
-      const predictSec = (fastMs + slowExtraMs) / 1000;
-      targetX += Number(remote._netVelX || 0) * predictSec;
-      targetY += Number(remote._netVelY || 0) * predictSec;
-      const rr = Number(remote.radius || 20);
-      targetX = clamp(targetX, rr, WORLD.width - rr);
-      targetY = clamp(targetY, rr, WORLD.height - rr);
+      const track = remoteBotMotion.get(id);
+      if (track) {
+        const ageMs = Math.max(0, nowPerf - track.recvAt);
+        // Smooth over normal RTDB jitter. Prediction is intentionally bounded so
+        // a disconnected client cannot let bots drift far away from authority.
+        const predictMs = Math.min(ageMs, 650);
+        const fullMs = Math.min(predictMs, 320);
+        const softMs = Math.max(0, predictMs - fullMs);
+        const predictSec = (fullMs + softMs * 0.45) / 1000;
+        targetX = track.netX + track.vx * predictSec;
+        targetY = track.netY + track.vy * predictSec;
+        const rr = Math.max(10, Number(remote.radius || 20));
+        targetX = clamp(targetX, rr, WORLD.width - rr);
+        targetY = clamp(targetY, rr, WORLD.height - rr);
+      }
     }
 
     let rb = renderBots.get(id);
     if (!rb) {
-      rb = { x: targetX, y: targetY, radius: remote.radius, seenId };
+      rb = { x: targetX, y: targetY, radius: Number(remote.radius || 20), seenId };
       renderBots.set(id, rb);
     }
     rb.seenId = seenId;
 
-    const errX = targetX - rb.x;
-    const errY = targetY - rb.y;
-    const errSq = errX * errX + errY * errY;
-    // Larger corrections catch up quickly, while normal motion is intentionally
-    // softer to hide network jitter. Truly huge errors snap to avoid rubber-band
-    // travel across the entire screen after respawns/splits.
-    if (errSq > 850 * 850) {
-      rb.x = targetX; rb.y = targetY;
+    const dx = targetX - rb.x;
+    const dy = targetY - rb.y;
+    const errorSq = dx * dx + dy * dy;
+    if (errorSq > 700 * 700) {
+      rb.x = targetX;
+      rb.y = targetY;
     } else {
-      const correctionBase = errSq > 170 * 170 ? 0.0000025 : 0.000035;
-      const smoothT = 1 - Math.pow(correctionBase, dt);
-      rb.x += errX * smoothT;
-      rb.y += errY * smoothT;
+      const t = errorSq > 130 * 130 ? catchupT : normalT;
+      rb.x += dx * t;
+      rb.y += dy * t;
     }
-    const radiusT = 1 - Math.pow(0.0005, dt);
-    rb.radius += (remote.radius - rb.radius) * radiusT;
+    rb.radius += (Number(remote.radius || rb.radius) - rb.radius) * radiusT;
   }
-  for (const [id, rb] of renderBots) if (rb.seenId !== seenId) renderBots.delete(id);
+
+  for (const [id, rb] of renderBots) {
+    if (rb.seenId !== seenId) renderBots.delete(id);
+  }
 }
 
 function drawBots(cam) {
-  const sourceEntries = localHost ? hostBots.entries() : remoteBotEntries.entries();
+  const sourceEntries = localHost ? hostBots.entries() : remoteBotEntries;
   const crowded = renderBots.size > 55;
   for (const [id, bot] of sourceEntries) {
     if (!bot || bot.eatenBy) continue;
@@ -2343,6 +2358,16 @@ window.addEventListener("keydown", (e) => {
 window.addEventListener("resize", resizeCanvas);
 window.addEventListener("beforeunload", () => {
   if (db && roomId && uid && localSlot !== null) remove(ref(db, `rooms/${roomId}/players/${localSlot}`)).catch(() => {});
+});
+
+// Surface unexpected runtime errors instead of silently leaving a client frozen.
+window.addEventListener("error", (event) => {
+  console.error("Runtime error", event.error || event.message);
+  if (roomId) showBanner(`Client error: ${event.message || "unknown error"}`);
+});
+window.addEventListener("unhandledrejection", (event) => {
+  console.error("Unhandled promise rejection", event.reason);
+  if (roomId) showBanner(`Network/client error: ${event.reason?.message || event.reason || "unknown error"}`);
 });
 
 resizeCanvas();
