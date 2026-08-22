@@ -30,7 +30,7 @@ const firebaseConfig = {
   appId: "1:257019969127:web:0a910b0fe08fde4d60dec2",
 };
 
-const BUILD_VERSION = "2.0.3-clientfix";
+const BUILD_VERSION = "2.0.4-clientfix2";
 const WORLD = { width: 5000, height: 4000 };
 const FOOD_TARGET = 400;
 const START_RADIUS = 30;
@@ -195,6 +195,10 @@ function randomName() {
 
 function cleanName(name) {
   return (name || "").trim().replace(/[<>]/g, "").slice(0, 18) || randomName();
+}
+
+function clamp(value, min, max) {
+  return value < min ? min : value > max ? max : value;
 }
 
 function makePiece(x, y, radius, mergeAt = 0, vx = 0, vy = 0) {

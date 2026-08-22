@@ -71,10 +71,15 @@ Gameplay unchanged. Performance pass: split Firebase listeners, 20 Hz host AI, 5
 No database schema or rules changes are required versus Build 2.0.0.
 
 
-## Build 2.0.3-clientfix
+## Build 2.0.4-clientfix2
 - Restored reliable `onValue` bot snapshots for clients.
 - Removed the child-event-only movement path that could stop updating.
 - Removed the permanent in-flight bot-network lock that could freeze all future host snapshots.
 - Bot positions sync at 10 Hz; clients use bounded render-only prediction/interpolation.
 - Host ignores ordinary movement echoes when reconciling authoritative bots.
 - Added visible runtime diagnostics for unexpected client errors.
+
+
+## 2.0.4 client hotfix
+- Restores the missing `clamp()` helper used by client-side bot prediction.
+- Static reference audit with TypeScript checkJs; no other missing global helpers detected.
