@@ -1,4 +1,4 @@
-# Blob Royale — Build 2.0.0 FFA3
+# Blob Royale — Build 2.0.1 Performance
 
 A browser-based Agar.io-inspired **1–3 player PvPvE free-for-all** using Firebase Realtime Database.
 
@@ -49,3 +49,23 @@ Authentication uses **in-memory anonymous Firebase persistence**, so separate br
 6. Create a fresh room after deploying the rules.
 
 The included ruleset is dedicated to this Agar.io FFA project and uses `/rooms`.
+
+
+## Build 2.0.1-performance
+
+Gameplay unchanged. Performance pass: split Firebase listeners, 20 Hz host AI, 5 Hz bot position sync, spatial bot AI/cannibal collision grid, visible-only pellet rendering, throttled local collisions/HUD, reduced Canvas2D blur, and slower sync for non-visual bot AI state.
+
+### Performance changes
+- Firebase listeners split by hot path; bot movement no longer rebuilds the complete room snapshot.
+- Food uses incremental child events and an incrementally maintained spatial grid.
+- Join reads only metadata + player slots instead of downloading the full room first.
+- Host AI runs at 20 Hz and bot rendering/network interpolation remains smooth.
+- Host hunter/cannibal/rival searches and bot-vs-bot eating use a spatial grid instead of all-pairs scans.
+- Slow AI state sync is separated from 5 Hz position/size sync.
+- Local pellet/bot collisions run ~29 Hz instead of every rendered frame.
+- Bot entry arrays are cached per network snapshot to reduce garbage collection.
+- Visible-only pellet rendering; fewer bot details during crowded split fights.
+- Canvas uses alpha:false/desynchronized where supported, DPR capped at 1.25, gameplay backdrop blur removed.
+- Full rendering is rate-limited on high-refresh displays while input/movement remain responsive.
+
+No database schema or rules changes are required versus Build 2.0.0.

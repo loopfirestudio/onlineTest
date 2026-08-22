@@ -1,5 +1,5 @@
 // Blob Royale — Agar.io-inspired 3-player PvPvE free-for-all with synchronized bots and splitting.
-// Build 2.0.0 adds three player slots, player-vs-player eating, cannibal bots, and fear AI.
+// Build 2.0.1 focuses on client + host performance without changing gameplay.
 // Firebase Web SDK 12.17.1 via Google's CDN.
 
 import { initializeApp } from "https://www.gstatic.com/firebasejs/12.17.1/firebase-app.js";
@@ -12,6 +12,9 @@ import {
   update,
   remove,
   onValue,
+  onChildAdded,
+  onChildChanged,
+  onChildRemoved,
   onDisconnect,
   runTransaction,
   serverTimestamp,
@@ -27,7 +30,7 @@ const firebaseConfig = {
   appId: "1:257019969127:web:0a910b0fe08fde4d60dec2",
 };
 
-const BUILD_VERSION = "2.0.0-ffa3";
+const BUILD_VERSION = "2.0.1-performance";
 const WORLD = { width: 5000, height: 4000 };
 const FOOD_TARGET = 400;
 const START_RADIUS = 30;
@@ -50,15 +53,21 @@ const BOT_MERGE_MS = 7000;
 
 // Performance tuning: AI does not need to run at display refresh rate. Rendering
 // stays at requestAnimationFrame speed while host AI is capped near 25 Hz.
-const BOT_SIM_INTERVAL_MS = 40;
-const PLAYER_NETWORK_INTERVAL_MS = 75;
-const BOT_NETWORK_INTERVAL_MS = 150;
+const BOT_SIM_INTERVAL_MS = 50; // 20 Hz authoritative AI; render remains requestAnimationFrame
+const PLAYER_NETWORK_INTERVAL_MS = 90; // ~11 Hz player sync with interpolation
+const BOT_NETWORK_INTERVAL_MS = 200; // 5 Hz bot position snapshots are enough for interpolation
+const BOT_STATE_NETWORK_INTERVAL_MS = 900; // slow-changing AI state is synced separately
 const LARGE_CELL_LOD_RADIUS = 180;
 const MAX_CONCURRENT_FOOD_CLAIMS = 10;
 const MAX_NEW_FOOD_CLAIMS_PER_TICK = 3;
 const MAX_CONCURRENT_BOT_FOOD_CLAIMS = 8;
 const MAX_BOT_EATS_PER_TICK = 4;
-const HUD_UPDATE_INTERVAL_MS = 220;
+const HUD_UPDATE_INTERVAL_MS = 450;
+const MIN_RENDER_INTERVAL_MS = 12; // avoids wasting CPU at 120/144/165 Hz displays
+const LOCAL_COLLISION_INTERVAL_MS = 34; // collision checks ~29 Hz instead of every rendered frame
+const BOT_GRID_SIZE = 420;
+const BOT_GRID_COLS = Math.ceil(WORLD.width / BOT_GRID_SIZE) + 2;
+const BOT_FAMILY_CHECK_INTERVAL_MS = 250;
 const FOOD_GRID_SIZE = 240;
 const FOOD_GRID_REBUILD_MS = 220;
 const TRANSFER_COOLDOWN_MS = 700;
@@ -83,7 +92,7 @@ const CANNIBAL_SENSE_RANGE = 1350;
 const CANNIBAL_EAT_GAIN = 0.80;
 
 const canvas = document.querySelector("#game");
-const ctx = canvas.getContext("2d");
+const ctx = canvas.getContext("2d", { alpha: false, desynchronized: true });
 const menu = document.querySelector("#menu");
 const hud = document.querySelector("#hud");
 const leaveBtn = document.querySelector("#leaveBtn");
@@ -112,13 +121,18 @@ let uid = null;
 let roomId = null;
 let roomUnsubscribe = null;
 let connectedUnsubscribe = null;
+let roomMetaLoaded = false;
+let roomPlayersLoaded = false;
 let roomState = null;
+let remoteBotEntries = [];
 let local = null;
 let localSlot = null;
 let localHost = false;
 let lastNetworkWrite = 0;
 let hostLoopAt = 0;
+let hostMaintenanceReadyAt = 0;
 let lastBotNetworkWrite = 0;
+let lastBotStateNetworkWrite = 0;
 let lastBotSimAt = 0;
 let eating = new Set();
 let botEating = new Set();
@@ -134,18 +148,31 @@ let lastPlayerSplitAt = 0;
 let lastHudUpdateAt = 0;
 let lastFoodGridBuildAt = 0;
 let foodGrid = new Map();
+let foodGridIndex = new Map();
 let foodGridSource = null;
+let lastLocalCollisionAt = 0;
+let hostBotGrid = new Map();
+let hostBotGridMaxRadius = 0;
+const foodScratch = [];
+const botScratch = [];
 let countedBotKills = new Set();
 let hostKillCounts = new Map();
 let pvpVictimProcessing = new Set();
 let pvpEaterProcessing = new Set();
 let hostPvpPendingVictims = new Map();
 let countedPvpKillEvents = new Set();
+let remoteBotsDirty = true;
+let botMealsDirty = true;
+let statsDirty = true;
+let lastBotFamilyCheckAt = 0;
 
 const pointer = { x: innerWidth / 2, y: innerHeight / 2, active: true };
 const renderPlayerPieces = new Map();
 const renderBots = new Map();
+let renderPlayerSeenId = 0;
+let renderBotSeenId = 0;
 const hostBots = new Map();
+const hostFamilyGroups = Array.from({ length: BOT_FAMILY_COUNT }, () => []);
 
 function firebaseConfigured() {
   return !Object.values(firebaseConfig).some((v) => String(v).includes("PASTE_YOUR"));
@@ -255,28 +282,34 @@ function makeInitialEnemies() {
 }
 
 function botIndexFromFamily(family) {
-  const n = Number(String(family || "bot0").replace(/\D/g, ""));
+  const value = String(family || "bot0");
+  const n = value.startsWith("bot") ? Number.parseInt(value.slice(3), 10) : Number.NaN;
   return Number.isFinite(n) ? n : 0;
 }
 
 function piecesOf(player) {
-  if (player?.pieces && Object.keys(player.pieces).length) return player.pieces;
+  if (player?.pieces) {
+    for (const id in player.pieces) if (player.pieces[id]) return player.pieces;
+  }
   if (!player) return {};
   return { p0: makePiece(player.x, player.y, player.radius) };
 }
 
 function aggregatePieces(pieces) {
-  const values = Object.values(pieces || {}).filter(Boolean);
-  if (!values.length) return { x: WORLD.width / 2, y: WORLD.height / 2, radius: START_RADIUS, area: START_RADIUS ** 2 };
   let area = 0;
   let wx = 0;
   let wy = 0;
-  for (const p of values) {
+  let found = false;
+  for (const id in (pieces || {})) {
+    const p = pieces[id];
+    if (!p) continue;
+    found = true;
     const a = Math.max(1, p.radius ** 2);
     area += a;
     wx += p.x * a;
     wy += p.y * a;
   }
+  if (!found || area <= 0) return { x: WORLD.width / 2, y: WORLD.height / 2, radius: START_RADIUS, area: START_RADIUS ** 2 };
   return { x: wx / area, y: wy / area, radius: Math.sqrt(area), area };
 }
 
@@ -370,10 +403,10 @@ async function joinRoom() {
     const code = roomInput.value.toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 6);
     if (code.length !== 6) throw new Error("Enter a 6-character room code.");
 
-    const roomSnap = await get(ref(db, `rooms/${code}`));
-    if (!roomSnap.exists()) throw new Error("Room not found.");
-    const data = roomSnap.val();
-    const existing = data.players || {};
+    const metaSnap = await get(ref(db, `rooms/${code}/meta`));
+    if (!metaSnap.exists()) throw new Error("Room not found.");
+    const playersSnap = await get(ref(db, `rooms/${code}/players`));
+    const existing = playersSnap.val() || {};
 
     const alreadyInRoom = Object.entries(existing).find(([, p]) => p?.uid === uid);
     let claimedSlot = alreadyInRoom ? Number(alreadyInRoom[0]) : null;
@@ -416,8 +449,11 @@ async function enterRoom(code, player, slot) {
   syncLocalAggregate();
   localSlot = slot;
   previousPlayerCount = 0;
+  hostLoopAt = performance.now();
+  hostMaintenanceReadyAt = performance.now() + 1800;
   lastBotSimAt = 0;
   lastBotNetworkWrite = 0;
+  lastBotStateNetworkWrite = 0;
   renderPlayerPieces.clear();
   renderBots.clear();
   hostBots.clear();
@@ -432,32 +468,40 @@ async function enterRoom(code, player, slot) {
   const playerRef = ref(db, `rooms/${roomId}/players/${localSlot}`);
   await onDisconnect(playerRef).remove();
 
-  const roomRef = ref(db, `rooms/${roomId}`);
-  roomUnsubscribe = onValue(roomRef, async (snap) => {
-    if (!snap.exists()) {
-      showBanner("Room closed");
-      await leaveRoom(false);
-      return;
-    }
+  // Performance: subscribe to hot paths separately. The old build listened to the
+  // entire room, so every 5-8 Hz bot movement snapshot forced all clients to
+  // deserialize the 400-pellet food map, stats and events again.
+  roomState = { meta: {}, players: {}, food: {}, bots: {}, stats: {}, pvpEvents: {}, botMeals: {} };
+  roomMetaLoaded = false;
+  roomPlayersLoaded = false;
+  const roomUnsubs = [];
 
-    roomState = snap.val();
+  const reconcileRoomMembership = async () => {
+    if (!roomId || !roomMetaLoaded || !roomPlayersLoaded) return;
     const players = roomState.players || {};
     const meta = roomState.meta || {};
     const playerValues = Object.values(players);
     previousPlayerCount = playerValues.length;
-
     const selfPresent = playerValues.some((p) => p?.uid === uid);
     const hostPresent = playerValues.some((p) => p?.uid === meta.hostUid);
     const wasHost = localHost;
     localHost = meta.hostUid === uid;
+
     if (localHost !== wasHost) {
       hostBots.clear();
+      hostBotGrid.clear();
+      hostBotGridMaxRadius = 0;
       botRespawnAt.clear();
       botMealProcessing.clear();
       hostPvpPendingVictims.clear();
       countedPvpKillEvents.clear();
       lastBotSimAt = 0;
       lastBotNetworkWrite = 0;
+      lastBotStateNetworkWrite = 0;
+      remoteBotsDirty = true;
+      botMealsDirty = true;
+      statsDirty = true;
+      lastBotFamilyCheckAt = 0;
     }
 
     if ((!meta.hostUid || !hostPresent) && selfPresent) {
@@ -474,14 +518,72 @@ async function enterRoom(code, player, slot) {
       return;
     }
 
-    processPvpEvents(roomState.pvpEvents || {});
     if (localHost) hostProcessPvpEventAcks(roomState.pvpEvents || {});
-    const hudNow = performance.now();
-    if (hudNow - lastHudUpdateAt >= HUD_UPDATE_INTERVAL_MS) {
-      lastHudUpdateAt = hudNow;
-      updateHud(players, roomState.bots || {});
+  };
+
+  roomUnsubs.push(onValue(ref(db, `rooms/${roomId}/meta`), async (snap) => {
+    if (!snap.exists()) {
+      showBanner("Room closed");
+      await leaveRoom(false);
+      return;
     }
-  });
+    roomState.meta = snap.val() || {};
+    roomMetaLoaded = true;
+    reconcileRoomMembership();
+  }));
+
+  roomUnsubs.push(onValue(ref(db, `rooms/${roomId}/players`), (snap) => {
+    roomState.players = snap.val() || {};
+    roomPlayersLoaded = true;
+    reconcileRoomMembership();
+  }));
+
+  const foodRef = ref(db, `rooms/${roomId}/food`);
+  const onFoodUpsert = (snap) => {
+    if (!snap.key) return;
+    const item = snap.val();
+    roomState.food[snap.key] = item;
+    foodGridUpsert(snap.key, item);
+    foodGridSource = roomState.food;
+  };
+  roomUnsubs.push(onChildAdded(foodRef, onFoodUpsert));
+  roomUnsubs.push(onChildChanged(foodRef, onFoodUpsert));
+  roomUnsubs.push(onChildRemoved(foodRef, (snap) => {
+    if (!snap.key) return;
+    delete roomState.food[snap.key];
+    foodGridRemove(snap.key);
+    foodGridSource = roomState.food;
+  }));
+
+  roomUnsubs.push(onValue(ref(db, `rooms/${roomId}/bots`), (snap) => {
+    roomState.bots = snap.val() || {};
+    remoteBotEntries = Object.entries(roomState.bots);
+    remoteBotsDirty = true;
+  }));
+
+  roomUnsubs.push(onValue(ref(db, `rooms/${roomId}/stats`), (snap) => {
+    roomState.stats = snap.val() || {};
+    statsDirty = true;
+  }));
+
+  roomUnsubs.push(onValue(ref(db, `rooms/${roomId}/pvpEvents`), (snap) => {
+    const events = snap.val() || {};
+    roomState.pvpEvents = events;
+    processPvpEvents(events);
+    if (localHost) hostProcessPvpEventAcks(events);
+  }));
+
+  roomUnsubs.push(onValue(ref(db, `rooms/${roomId}/botMeals`), (snap) => {
+    roomState.botMeals = snap.val() || {};
+    botMealsDirty = true;
+  }));
+
+  roomUnsubscribe = () => {
+    for (const off of roomUnsubs) {
+      try { off(); } catch {}
+    }
+    roomUnsubs.length = 0;
+  };
 
   connectedUnsubscribe = onValue(ref(db, ".info/connected"), (snap) => {
     if (snap.val() === true && roomId) onDisconnect(ref(db, `rooms/${roomId}/players/${localSlot}`)).remove().catch(console.warn);
@@ -496,6 +598,8 @@ async function leaveRoom(removeSelf = true) {
   connectedUnsubscribe?.();
   roomUnsubscribe = null;
   connectedUnsubscribe = null;
+  roomMetaLoaded = false;
+  roomPlayersLoaded = false;
 
   if (removeSelf && db && oldRoom && uid) {
     try { await remove(ref(db, `rooms/${oldRoom}/players/${localSlot}`)); } catch (e) { console.warn(e); }
@@ -510,6 +614,7 @@ async function leaveRoom(removeSelf = true) {
 
   roomId = null;
   roomState = null;
+  remoteBotEntries = [];
   local = null;
   localSlot = null;
   localHost = false;
@@ -529,12 +634,23 @@ async function leaveRoom(removeSelf = true) {
   hostPvpPendingVictims.clear();
   countedPvpKillEvents.clear();
   foodGrid.clear();
+  foodGridIndex.clear();
   foodGridSource = null;
+  hostBotGrid.clear();
+  hostBotGridMaxRadius = 0;
+  lastLocalCollisionAt = 0;
+  remoteBotsDirty = true;
+  botMealsDirty = true;
+  statsDirty = true;
+  lastBotFamilyCheckAt = 0;
   invulnerableUntil = 0;
   deathNoticeUntil = 0;
   previousPlayerCount = 0;
+  hostLoopAt = 0;
+  hostMaintenanceReadyAt = 0;
   lastBotSimAt = 0;
   lastBotNetworkWrite = 0;
+  lastBotStateNetworkWrite = 0;
   hideBanner();
   hud.classList.add("hidden");
   leaderboard?.classList.add("hidden");
@@ -564,6 +680,8 @@ function playerThreatKillCount(playerUid) {
 }
 
 function syncHostKillCounts() {
+  if (!statsDirty) return;
+  statsDirty = false;
   const remote = roomState?.stats?.playerKills || {};
   for (const [playerUid, value] of Object.entries(remote)) {
     const count = Math.max(0, Number(value) || 0);
@@ -869,7 +987,7 @@ function showBanner(text) {
 function hideBanner() { banner.classList.add("hidden"); }
 
 function resizeCanvas() {
-  const dpr = Math.min(devicePixelRatio || 1, 1.5);
+  const dpr = Math.min(devicePixelRatio || 1, 1.25);
   canvas.width = Math.floor(innerWidth * dpr);
   canvas.height = Math.floor(innerHeight * dpr);
   canvas.style.width = `${innerWidth}px`;
@@ -996,7 +1114,9 @@ function tickMovement(dt) {
   const players = roomState.players || {};
 
   const aim = currentAim();
-  for (const piece of Object.values(local.pieces || {})) {
+  for (const pieceId in (local.pieces || {})) {
+    const piece = local.pieces[pieceId];
+    if (!piece) continue;
     const speed = Math.max(90, 285 - piece.radius * 2.15) * aim.intensity;
     piece.x += aim.x * speed * dt + (piece.vx || 0) * dt;
     piece.y += aim.y * speed * dt + (piece.vy || 0) * dt;
@@ -1020,8 +1140,6 @@ function tickMovement(dt) {
     update(ref(db, `rooms/${roomId}/players/${localSlot}`), publicPlayerPayload()).catch(console.warn);
   }
 
-  checkFoodCollisions();
-  checkBotCollisions();
 }
 
 function writeLocalNow() {
@@ -1031,26 +1149,44 @@ function writeLocalNow() {
 
 function foodGridKey(gx, gy) { return `${gx},${gy}`; }
 
-function ensureFoodGrid(now = performance.now()) {
-  const food = roomState?.food || {};
-  if (food === foodGridSource && now - lastFoodGridBuildAt < FOOD_GRID_REBUILD_MS) return;
-  foodGridSource = food;
-  lastFoodGridBuildAt = now;
-  foodGrid = new Map();
-  for (const [id, item] of Object.entries(food)) {
-    if (!item || item.claimedBy) continue;
-    const gx = Math.floor(item.x / FOOD_GRID_SIZE);
-    const gy = Math.floor(item.y / FOOD_GRID_SIZE);
-    const key = foodGridKey(gx, gy);
-    let bucket = foodGrid.get(key);
-    if (!bucket) foodGrid.set(key, bucket = []);
-    bucket.push([id, item]);
+function foodGridRemove(foodId) {
+  const key = foodGridIndex.get(foodId);
+  if (key === undefined) return;
+  const bucket = foodGrid.get(key);
+  if (bucket) {
+    for (let i = bucket.length - 1; i >= 0; i--) {
+      if (bucket[i][0] === foodId) { bucket.splice(i, 1); break; }
+    }
+    if (!bucket.length) foodGrid.delete(key);
   }
+  foodGridIndex.delete(foodId);
 }
 
-function nearbyFood(x, y, radius) {
+function foodGridUpsert(foodId, item) {
+  foodGridRemove(foodId);
+  if (!item || item.claimedBy) return;
+  const gx = Math.floor(item.x / FOOD_GRID_SIZE);
+  const gy = Math.floor(item.y / FOOD_GRID_SIZE);
+  const key = foodGridKey(gx, gy);
+  let bucket = foodGrid.get(key);
+  if (!bucket) foodGrid.set(key, bucket = []);
+  bucket.push([foodId, item]);
+  foodGridIndex.set(foodId, key);
+}
+
+function ensureFoodGrid(now = performance.now()) {
+  const food = roomState?.food || {};
+  if (food === foodGridSource) return;
+  foodGridSource = food;
+  lastFoodGridBuildAt = now;
+  foodGrid.clear();
+  foodGridIndex.clear();
+  for (const [id, item] of Object.entries(food)) foodGridUpsert(id, item);
+}
+
+function collectNearbyFood(x, y, radius, out = foodScratch) {
   ensureFoodGrid();
-  const out = [];
+  out.length = 0;
   const minGX = Math.floor((x - radius) / FOOD_GRID_SIZE);
   const maxGX = Math.floor((x + radius) / FOOD_GRID_SIZE);
   const minGY = Math.floor((y - radius) / FOOD_GRID_SIZE);
@@ -1058,7 +1194,8 @@ function nearbyFood(x, y, radius) {
   for (let gx = minGX; gx <= maxGX; gx++) {
     for (let gy = minGY; gy <= maxGY; gy++) {
       const bucket = foodGrid.get(foodGridKey(gx, gy));
-      if (bucket) out.push(...bucket);
+      if (!bucket) continue;
+      for (let i = 0; i < bucket.length; i++) out.push(bucket[i]);
     }
   }
   return out;
@@ -1072,7 +1209,7 @@ function checkFoodCollisions() {
   const visited = new Set();
 
   for (const [pieceId, piece] of pieces) {
-    const candidates = nearbyFood(piece.x, piece.y, piece.radius + 20);
+    const candidates = collectNearbyFood(piece.x, piece.y, piece.radius + 20);
     for (const [foodId, f] of candidates) {
       if (visited.has(foodId) || !f || f.claimedBy || eating.has(foodId)) continue;
       visited.add(foodId);
@@ -1116,7 +1253,7 @@ async function claimFood(foodId, food, pieceId) {
 
 function checkBotCollisions() {
   if (!local) return;
-  const botEntries = localHost ? hostBots.entries() : Object.entries(roomState?.bots || {});
+  const botEntries = localHost ? hostBots.entries() : remoteBotEntries;
   const pieceEntries = Object.entries(local.pieces || {});
   const protectedFromBots = performance.now() < invulnerableUntil;
   let consumedThisTick = 0;
@@ -1127,24 +1264,26 @@ function checkBotCollisions() {
     // Clients collide with the interpolated position they see. The host already owns
     // the authoritative simulation, so it collides directly with hostBots.
     const rendered = !localHost ? renderBots.get(botId) : null;
-    const collisionBot = rendered ? { ...bot, x: rendered.x, y: rendered.y, radius: rendered.radius } : bot;
+    const bx = rendered?.x ?? bot.x;
+    const by = rendered?.y ?? bot.y;
+    const br = rendered?.radius ?? bot.radius;
 
     for (const [pieceId, piece] of pieceEntries) {
       if (!local.pieces?.[pieceId]) continue;
-      const dx = piece.x - collisionBot.x;
-      const dy = piece.y - collisionBot.y;
+      const dx = piece.x - bx;
+      const dy = piece.y - by;
       const distSq = dx * dx + dy * dy;
 
-      if (canConsumeSquared(piece.radius, collisionBot.radius, distSq)) {
-        if (localHost) consumeBotAsHost(botId, collisionBot, pieceId);
-        else claimBot(botId, collisionBot, pieceId);
+      if (canConsumeSquared(piece.radius, br, distSq)) {
+        if (localHost) consumeBotAsHost(botId, bot, pieceId);
+        else claimBot(botId, bot, pieceId);
         consumedThisTick++;
         if (consumedThisTick >= MAX_BOT_EATS_PER_TICK) return;
         break;
       }
 
-      if (!protectedFromBots && canConsumeSquared(collisionBot.radius, piece.radius, distSq)) {
-        eatenByBot(pieceId, botId, collisionBot);
+      if (!protectedFromBots && canConsumeSquared(br, piece.radius, distSq)) {
+        eatenByBot(pieceId, botId, bot);
         break;
       }
     }
@@ -1270,7 +1409,7 @@ function deleteBotCell(botId, familyHint = null) {
   botRemoving.add(botId);
   hostBots.delete(botId);
 
-  if (family && String(family).startsWith("bot") && !familyCells(family).length && !botRespawnAt.has(family)) {
+  if (family && String(family).startsWith("bot") && familyCellCount(family) === 0 && !botRespawnAt.has(family)) {
     botRespawnAt.set(family, Date.now() + 700 + Math.floor(Math.random() * 800));
   }
 
@@ -1280,16 +1419,27 @@ function deleteBotCell(botId, familyHint = null) {
     .finally(() => botRemoving.delete(botId));
 }
 
-function familyCells(family) {
-  return [...hostBots.entries()].filter(([, b]) => b && !b.eatenBy && b.family === family);
+function familyCellCount(family) {
+  let count = 0;
+  for (const bot of hostBots.values()) if (bot && !bot.eatenBy && bot.family === family) count++;
+  return count;
 }
 
 function ensureBotFamilies() {
   if (!localHost || !roomId) return;
   const now = Date.now();
+  if (now - lastBotFamilyCheckAt < BOT_FAMILY_CHECK_INTERVAL_MS) return;
+  lastBotFamilyCheckAt = now;
+  const counts = new Map();
+  for (const bot of hostBots.values()) {
+    if (!bot || bot.eatenBy) continue;
+    const family = bot.family || "bot0";
+    counts.set(family, (counts.get(family) || 0) + 1);
+  }
+
   for (let i = 0; i < BOT_FAMILY_COUNT; i++) {
     const family = `bot${i}`;
-    if (familyCells(family).length) {
+    if ((counts.get(family) || 0) > 0) {
       botRespawnAt.delete(family);
       continue;
     }
@@ -1299,11 +1449,11 @@ function ensureBotFamilies() {
       continue;
     }
     if (now < botRespawnAt.get(family)) continue;
-    // Avoid reusing a base id until its previous delete has actually completed.
     if (botRemoving.has(family)) continue;
 
     const fresh = makeBot(i, family);
     hostBots.set(family, fresh);
+    counts.set(family, 1);
     botRespawnAt.delete(family);
     set(ref(db, `rooms/${roomId}/bots/${family}`), fresh).catch((err) => {
       console.warn(err);
@@ -1315,6 +1465,8 @@ function ensureBotFamilies() {
 
 function ensureHostBots() {
   if (!localHost || !roomState) return;
+  if (!remoteBotsDirty) { ensureBotFamilies(); return; }
+  remoteBotsDirty = false;
   const remoteBots = roomState.bots || {};
 
   for (const [id, bot] of Object.entries(remoteBots)) {
@@ -1327,6 +1479,7 @@ function ensureHostBots() {
       if (!botRemoving.has(id)) deleteBotCell(id, bot.family);
       continue;
     }
+    if (botRemoving.has(id)) continue;
     if (bot.eatenBy) {
       recordPlayerBotKill(bot.eatenBy, id);
       deleteBotCell(id, bot.family);
@@ -1346,18 +1499,59 @@ function ensureHostBots() {
 
 function allPlayerTargets() {
   const targets = [];
-  for (const p of Object.values(roomState?.players || {}).filter(Boolean)) {
+  const players = roomState?.players || {};
+  for (const p of Object.values(players)) {
+    if (!p) continue;
     const source = p.uid === uid && local ? local : p;
     const kills = playerThreatKillCount(p.uid);
-    for (const [pieceId, piece] of Object.entries(piecesOf(source))) {
-      targets.push({ ...piece, ownerUid: p.uid, pieceId, kills });
+    const pieces = piecesOf(source);
+    for (const pieceId in pieces) {
+      const piece = pieces[pieceId];
+      if (!piece) continue;
+      targets.push({ x: piece.x, y: piece.y, radius: piece.radius, ownerUid: p.uid, pieceId, kills });
     }
   }
   return targets;
 }
 
+function botGridKeyFor(x, y) {
+  const gx = Math.max(0, Math.floor(x / BOT_GRID_SIZE));
+  const gy = Math.max(0, Math.floor(y / BOT_GRID_SIZE));
+  return gx + gy * BOT_GRID_COLS;
+}
+
+function rebuildHostBotGrid() {
+  hostBotGrid.clear();
+  hostBotGridMaxRadius = 0;
+  for (const [id, bot] of hostBots) {
+    if (!bot || bot.eatenBy || botRemoving.has(id)) continue;
+    const key = botGridKeyFor(bot.x, bot.y);
+    let bucket = hostBotGrid.get(key);
+    if (!bucket) hostBotGrid.set(key, bucket = []);
+    bucket.push(id);
+    if (bot.radius > hostBotGridMaxRadius) hostBotGridMaxRadius = bot.radius;
+  }
+}
+
+function collectNearbyBotIds(x, y, radius, out = botScratch) {
+  out.length = 0;
+  const minGX = Math.max(0, Math.floor((x - radius) / BOT_GRID_SIZE));
+  const maxGX = Math.floor((x + radius) / BOT_GRID_SIZE);
+  const minGY = Math.max(0, Math.floor((y - radius) / BOT_GRID_SIZE));
+  const maxGY = Math.floor((y + radius) / BOT_GRID_SIZE);
+  for (let gx = minGX; gx <= maxGX; gx++) {
+    for (let gy = minGY; gy <= maxGY; gy++) {
+      const bucket = hostBotGrid.get(gx + gy * BOT_GRID_COLS);
+      if (!bucket) continue;
+      for (let i = 0; i < bucket.length; i++) out.push(bucket[i]);
+    }
+  }
+  return out;
+}
+
 function processBotMeals() {
-  if (!localHost || !roomId) return;
+  if (!localHost || !roomId || !botMealsDirty) return;
+  botMealsDirty = false;
   const meals = roomState?.botMeals || {};
   for (const [mealId, meal] of Object.entries(meals)) {
     if (!meal || botMealProcessing.has(mealId)) continue;
@@ -1381,7 +1575,7 @@ function splitBot(botId, bot, aimX, aimY) {
   if (bot.radius < BOT_SPLIT_MIN_RADIUS || now < (bot.splitReadyAt || 0)) return false;
   const family = bot.family || `bot${botIndexFromFamily(botId)}`;
   const familyLimit = BOT_MAX_FAMILY_CELLS;
-  if (familyCells(family).length >= familyLimit) return false;
+  if (familyCellCount(family) >= familyLimit) return false;
 
   const mag = Math.hypot(aimX, aimY) || 1;
   aimX /= mag; aimY /= mag;
@@ -1431,23 +1625,27 @@ function mergeBotCells(bigId, big, smallId, small) {
 
 function resolveBotFamilyInteractions(dt) {
   const now = Date.now();
-  const groups = new Map();
+  for (let i = 0; i < hostFamilyGroups.length; i++) hostFamilyGroups[i].length = 0;
   for (const [id, bot] of hostBots) {
-    const family = bot.family || `bot${botIndexFromFamily(id)}`;
-    if (!groups.has(family)) groups.set(family, []);
-    groups.get(family).push([id, bot]);
+    if (!bot || bot.eatenBy) continue;
+    const index = botIndexFromFamily(bot.family || id);
+    if (index >= 0 && index < BOT_FAMILY_COUNT) hostFamilyGroups[index].push(id);
   }
 
-  for (const entries of groups.values()) {
-    for (let i = 0; i < entries.length; i++) {
-      const [idA, a] = entries[i];
-      if (!hostBots.has(idA)) continue;
-      for (let j = i + 1; j < entries.length; j++) {
-        const [idB, b] = entries[j];
-        if (!hostBots.has(idB)) continue;
+  for (let gi = 0; gi < hostFamilyGroups.length; gi++) {
+    const ids = hostFamilyGroups[gi];
+    for (let i = 0; i < ids.length; i++) {
+      const idA = ids[i];
+      const a = hostBots.get(idA);
+      if (!a) continue;
+      for (let j = i + 1; j < ids.length; j++) {
+        const idB = ids[j];
+        const b = hostBots.get(idB);
+        if (!b) continue;
         let dx = b.x - a.x;
         let dy = b.y - a.y;
-        let d = Math.hypot(dx, dy) || 0.001;
+        const d2 = dx * dx + dy * dy;
+        const d = Math.sqrt(d2) || 0.001;
         const mergeReady = now >= (a.mergeAt || 0) && now >= (b.mergeAt || 0);
 
         if (mergeReady && d < (a.radius + b.radius) * 0.6) {
@@ -1482,9 +1680,10 @@ function tickBots(dt, now) {
   if (!hostBots.size) return;
 
   const playerTargets = allPlayerTargets();
-  const food = roomState.food || {};
   ensureFoodGrid(now);
+  rebuildHostBotGrid();
   const entriesAtStart = [...hostBots.entries()];
+  const epochNow = Date.now();
   const wallMargin = 150;
 
   for (const [botId, bot] of entriesAtStart) {
@@ -1495,12 +1694,12 @@ function tickBots(dt, now) {
     let dirX = bot.vx || 1;
     let dirY = bot.vy || 0;
     let threat = null;
-    let threatDist = Infinity;
+    let threatDistSq = Infinity;
     let threatFear = 0;
     let playerPrey = null;
-    let playerPreyDist = Infinity;
+    let playerPreyDistSq = Infinity;
     let botPrey = null;
-    let botPreyDist = Infinity;
+    let botPreyDistSq = Infinity;
 
     // Reputation/fear: normal bots remember each player's recent kill reputation through
     // the host-owned room counter. The more dangerous a player has proven to be,
@@ -1509,28 +1708,28 @@ function tickBots(dt, now) {
     const baseThreatRange = personality === "dumb" ? 260 : personality === "chaos" ? 420 : 760;
     const cautiousAroundReputation = personality !== "hunter" && personality !== "cannibal";
     for (const p of playerTargets) {
-      const d = Math.hypot(p.x - bot.x, p.y - bot.y);
+      const pdx = p.x - bot.x;
+      const pdy = p.y - bot.y;
+      const d2 = pdx * pdx + pdy * pdy;
       const fear = Math.min(1, Math.max(0, Number(p.kills || 0)) / FEAR_FULL_KILLS);
       const obviousThreat = p.radius > bot.radius * BOT_EAT_RATIO;
       const reputationThreat = cautiousAroundReputation
         && fear > 0.04
         && p.radius > bot.radius * (0.88 - fear * 0.28);
       const effectiveThreatRange = baseThreatRange + (cautiousAroundReputation ? fear * FEAR_EXTRA_RANGE : 0);
-      if ((obviousThreat || reputationThreat) && d < effectiveThreatRange && d < threatDist) {
+      if ((obviousThreat || reputationThreat) && d2 < effectiveThreatRange * effectiveThreatRange && d2 < threatDistSq) {
         threat = p;
-        threatDist = d;
+        threatDistSq = d2;
         threatFear = reputationThreat ? fear : Math.max(threatFear, fear * 0.4);
       }
 
-      if (bot.radius > p.radius * BOT_EAT_RATIO && d < 950 && d < playerPreyDist) {
-        // High-reputation players are much harder to bait into easy fights: cautious
-        // bots only approach them when they have a very convincing size advantage.
+      if (bot.radius > p.radius * BOT_EAT_RATIO && d2 < 950 * 950 && d2 < playerPreyDistSq) {
         const safeEnoughToHunt = !cautiousAroundReputation
           || fear < 0.20
           || bot.radius > p.radius * (1.35 + fear * 0.70);
         if (safeEnoughToHunt) {
           playerPrey = p;
-          playerPreyDist = d;
+          playerPreyDistSq = d2;
         }
       }
     }
@@ -1539,17 +1738,24 @@ function tickBots(dt, now) {
       const preySense = personality === "cannibal" ? CANNIBAL_SENSE_RANGE : 920;
       const preyRatio = personality === "cannibal" ? 1.06 : BOT_EAT_RATIO;
       const botThreatSense = personality === "cannibal" ? 820 : 700;
-      for (const [otherId, other] of hostBots) {
-        if (otherId === botId || !other || other.eatenBy || other.family === bot.family) continue;
-        const d = Math.hypot(other.x - bot.x, other.y - bot.y);
-        if (other.radius > bot.radius * BOT_EAT_RATIO && d < botThreatSense && d < threatDist) {
+      const sense = Math.max(preySense, botThreatSense);
+      const nearbyIds = collectNearbyBotIds(bot.x, bot.y, sense);
+      for (let ni = 0; ni < nearbyIds.length; ni++) {
+        const otherId = nearbyIds[ni];
+        if (otherId === botId) continue;
+        const other = hostBots.get(otherId);
+        if (!other || other.eatenBy || other.family === bot.family) continue;
+        const odx = other.x - bot.x;
+        const ody = other.y - bot.y;
+        const d2 = odx * odx + ody * ody;
+        if (other.radius > bot.radius * BOT_EAT_RATIO && d2 < botThreatSense * botThreatSense && d2 < threatDistSq) {
           threat = other;
-          threatDist = d;
+          threatDistSq = d2;
           threatFear = 0;
         }
-        if (bot.radius > other.radius * preyRatio && d < preySense && d < botPreyDist) {
+        if (bot.radius > other.radius * preyRatio && d2 < preySense * preySense && d2 < botPreyDistSq) {
           botPrey = other;
-          botPreyDist = d;
+          botPreyDistSq = d2;
         }
       }
     }
@@ -1562,23 +1768,23 @@ function tickBots(dt, now) {
       // across a large radius and split only when it gives them a strong eat angle.
       dirX = botPrey.x - bot.x;
       dirY = botPrey.y - bot.y;
-      if (botPreyDist > bot.radius * 1.35 && botPreyDist < 520 && bot.radius > botPrey.radius * 1.42) {
+      if (botPreyDistSq > (bot.radius * 1.35) ** 2 && botPreyDistSq < 520 * 520 && bot.radius > botPrey.radius * 1.42) {
         splitBot(botId, bot, dirX, dirY);
       }
     } else if (personality === "hunter" && playerPrey) {
       // Hunter bots prioritize human players and deliberately split-attack.
       dirX = playerPrey.x - bot.x;
       dirY = playerPrey.y - bot.y;
-      if (playerPreyDist > bot.radius * 1.4 && playerPreyDist < 470 && bot.radius > playerPrey.radius * 1.43) {
+      if (playerPreyDistSq > (bot.radius * 1.4) ** 2 && playerPreyDistSq < 470 * 470 && bot.radius > playerPrey.radius * 1.43) {
         splitBot(botId, bot, dirX, dirY);
       }
     } else if (personality === "rival" && (botPrey || playerPrey)) {
       // Rival bots prefer eating other bot families, then fall back to players.
       const prey = botPrey || playerPrey;
-      const preyDist = botPrey ? botPreyDist : playerPreyDist;
+      const preyDistSq = botPrey ? botPreyDistSq : playerPreyDistSq;
       dirX = prey.x - bot.x;
       dirY = prey.y - bot.y;
-      if (preyDist > bot.radius * 1.4 && preyDist < 450 && bot.radius > prey.radius * 1.45) {
+      if (preyDistSq > (bot.radius * 1.4) ** 2 && preyDistSq < 450 * 450 && bot.radius > prey.radius * 1.45) {
         splitBot(botId, bot, dirX, dirY);
       }
     } else if (personality !== "dumb" && playerPrey && personality !== "chaos" && personality !== "cannibal") {
@@ -1590,7 +1796,7 @@ function tickBots(dt, now) {
       let nearestFoodDistSq = foodSense * foodSense;
       // Dumb bots are bad at choosing food; chaos bots are slightly better but unstable.
       if (personality !== "dumb" || Math.random() < 0.35) {
-        for (const [, f] of nearbyFood(bot.x, bot.y, foodSense)) {
+        for (const [, f] of collectNearbyFood(bot.x, bot.y, foodSense)) {
           if (!f || f.claimedBy) continue;
           const fdx = f.x - bot.x;
           const fdy = f.y - bot.y;
@@ -1601,19 +1807,19 @@ function tickBots(dt, now) {
       if (nearestFood && personality !== "chaos") {
         dirX = nearestFood.x - bot.x;
         dirY = nearestFood.y - bot.y;
-      } else if (Date.now() >= (bot.turnAt || 0)) {
+      } else if (epochNow >= (bot.turnAt || 0)) {
         const angle = Math.random() * Math.PI * 2;
         dirX = Math.cos(angle);
         dirY = Math.sin(angle);
         const turnMin = personality === "dumb" ? 450 : personality === "chaos" ? 650 : personality === "cannibal" ? 800 : 1100;
         const turnSpread = personality === "dumb" ? 1300 : personality === "chaos" ? 1700 : personality === "cannibal" ? 1700 : 2800;
-        bot.turnAt = Date.now() + turnMin + Math.floor(Math.random() * turnSpread);
+        bot.turnAt = epochNow + turnMin + Math.floor(Math.random() * turnSpread);
       }
     }
 
     // Chaos bots split in random directions for no good reason. Dumb bots do it rarely too.
     const randomSplitRate = personality === "chaos" ? 0.22 : personality === "dumb" ? 0.035 : 0;
-    if (randomSplitRate && bot.radius >= BOT_SPLIT_MIN_RADIUS && Date.now() >= (bot.splitReadyAt || 0) && Math.random() < randomSplitRate * dt) {
+    if (randomSplitRate && bot.radius >= BOT_SPLIT_MIN_RADIUS && epochNow >= (bot.splitReadyAt || 0) && Math.random() < randomSplitRate * dt) {
       const angle = Math.random() * Math.PI * 2;
       splitBot(botId, bot, Math.cos(angle), Math.sin(angle));
     }
@@ -1646,7 +1852,7 @@ function tickBots(dt, now) {
     bot.x = Math.max(bot.radius, Math.min(WORLD.width - bot.radius, bot.x));
     bot.y = Math.max(bot.radius, Math.min(WORLD.height - bot.radius, bot.y));
 
-    for (const [foodId, f] of nearbyFood(bot.x, bot.y, bot.radius + 18)) {
+    for (const [foodId, f] of collectNearbyFood(bot.x, bot.y, bot.radius + 18)) {
       if (!f || f.claimedBy) continue;
       const reach = bot.radius + (f.r || 7) * 0.35;
       const fdx = bot.x - f.x;
@@ -1661,14 +1867,17 @@ function tickBots(dt, now) {
 
   resolveBotFamilyInteractions(dt);
 
-  // Different enemy families can eat each other's cells.
-  const botEntries = [...hostBots.entries()];
-  for (let i = 0; i < botEntries.length; i++) {
-    const [idA, a] = botEntries[i];
-    if (!hostBots.has(idA)) continue;
-    for (let j = i + 1; j < botEntries.length; j++) {
-      const [idB, b] = botEntries[j];
-      if (!hostBots.has(idB) || a.family === b.family) continue;
+  // Different enemy families can eat each other. Rebuild a spatial grid after
+  // movement so this is no longer an O(n²) all-pairs scan when many bots split.
+  rebuildHostBotGrid();
+  for (const [idA, a] of hostBots) {
+    if (!a || a.eatenBy || !hostBots.has(idA)) continue;
+    const nearbyIds = collectNearbyBotIds(a.x, a.y, Math.max(a.radius, hostBotGridMaxRadius) + 12);
+    for (let ni = 0; ni < nearbyIds.length; ni++) {
+      const idB = nearbyIds[ni];
+      if (idB <= idA || !hostBots.has(idA) || !hostBots.has(idB)) continue;
+      const b = hostBots.get(idB);
+      if (!b || b.eatenBy || a.family === b.family) continue;
       const bdx = a.x - b.x;
       const bdy = a.y - b.y;
       const distSq = bdx * bdx + bdy * bdy;
@@ -1687,30 +1896,32 @@ function tickBots(dt, now) {
 
   if (now - lastBotNetworkWrite > BOT_NETWORK_INTERVAL_MS) {
     lastBotNetworkWrite = now;
+    const syncFullState = now - lastBotStateNetworkWrite > BOT_STATE_NETWORK_INTERVAL_MS;
+    if (syncFullState) lastBotStateNetworkWrite = now;
     const patch = {};
     for (const [id, bot] of hostBots) {
       if (botRemoving.has(id)) continue;
-      patch[`bots/${id}/family`] = bot.family;
-      patch[`bots/${id}/name`] = bot.name;
-      patch[`bots/${id}/personality`] = bot.personality || "dumb";
+      // Hot path: clients only need position + size for rendering/collisions.
       patch[`bots/${id}/x`] = Math.round(bot.x * 10) / 10;
       patch[`bots/${id}/y`] = Math.round(bot.y * 10) / 10;
       patch[`bots/${id}/radius`] = Math.round(bot.radius * 100) / 100;
-      patch[`bots/${id}/color`] = bot.color;
-      patch[`bots/${id}/vx`] = Math.round(bot.vx * 10000) / 10000;
-      patch[`bots/${id}/vy`] = Math.round(bot.vy * 10000) / 10000;
-      patch[`bots/${id}/boostX`] = Math.round((bot.boostX || 0) * 100) / 100;
-      patch[`bots/${id}/boostY`] = Math.round((bot.boostY || 0) * 100) / 100;
-      patch[`bots/${id}/turnAt`] = Math.round(bot.turnAt || 0);
-      patch[`bots/${id}/mergeAt`] = Math.round(bot.mergeAt || 0);
-      patch[`bots/${id}/splitReadyAt`] = Math.round(bot.splitReadyAt || 0);
+      // Host migration state is much less time-sensitive, so sync it ~1 Hz.
+      if (syncFullState) {
+        patch[`bots/${id}/vx`] = Math.round(bot.vx * 1000) / 1000;
+        patch[`bots/${id}/vy`] = Math.round(bot.vy * 1000) / 1000;
+        patch[`bots/${id}/boostX`] = Math.round((bot.boostX || 0) * 10) / 10;
+        patch[`bots/${id}/boostY`] = Math.round((bot.boostY || 0) * 10) / 10;
+        patch[`bots/${id}/turnAt`] = Math.round(bot.turnAt || 0);
+        patch[`bots/${id}/mergeAt`] = Math.round(bot.mergeAt || 0);
+        patch[`bots/${id}/splitReadyAt`] = Math.round(bot.splitReadyAt || 0);
+      }
     }
     if (Object.keys(patch).length) update(ref(db, `rooms/${roomId}`), patch).catch(console.warn);
   }
 }
 
 function hostMaintenance(now) {
-  if (!localHost || !roomId || !roomState || now - hostLoopAt < 1200) return;
+  if (!localHost || !roomId || !roomState || now < hostMaintenanceReadyAt || now - hostLoopAt < 1400) return;
   hostLoopAt = now;
   const food = roomState.food || {};
   const patch = {};
@@ -1759,64 +1970,75 @@ function drawGrid(cam) {
 }
 
 function drawFood(cam) {
-  const food = roomState?.food || {};
-  for (const f of Object.values(food)) {
-    if (!f || f.claimedBy) continue;
-    const x = f.x - cam.x;
-    const y = f.y - cam.y;
-    if (x < -16 || y < -16 || x > innerWidth + 16 || y > innerHeight + 16) continue;
-    ctx.beginPath();
-    ctx.arc(x, y, f.r || 7, 0, Math.PI * 2);
-    ctx.fillStyle = f.color || "#fff";
-    ctx.fill();
+  ensureFoodGrid(performance.now());
+  const minGX = Math.max(0, Math.floor((cam.x - 20) / FOOD_GRID_SIZE));
+  const maxGX = Math.floor((cam.x + innerWidth + 20) / FOOD_GRID_SIZE);
+  const minGY = Math.max(0, Math.floor((cam.y - 20) / FOOD_GRID_SIZE));
+  const maxGY = Math.floor((cam.y + innerHeight + 20) / FOOD_GRID_SIZE);
+  for (let gx = minGX; gx <= maxGX; gx++) {
+    for (let gy = minGY; gy <= maxGY; gy++) {
+      const bucket = foodGrid.get(foodGridKey(gx, gy));
+      if (!bucket) continue;
+      for (let i = 0; i < bucket.length; i++) {
+        const f = bucket[i][1];
+        if (!f || f.claimedBy) continue;
+        const x = f.x - cam.x;
+        const y = f.y - cam.y;
+        const r = f.r || 7;
+        if (x < -16 || y < -16 || x > innerWidth + 16 || y > innerHeight + 16) continue;
+        ctx.beginPath();
+        ctx.arc(x, y, r, 0, Math.PI * 2);
+        ctx.fillStyle = f.color || "#fff";
+        ctx.fill();
+      }
+    }
   }
 }
 
 function smoothPlayerPieces(dt) {
   const players = roomState?.players || {};
-  const active = new Set();
+  const seenId = ++renderPlayerSeenId;
+  const smoothT = 1 - Math.pow(0.001, dt);
   for (const [slot, p] of Object.entries(players)) {
     const source = p.uid === uid && local ? local : p;
     for (const [pieceId, piece] of Object.entries(piecesOf(source))) {
       const key = `${slot}:${pieceId}`;
-      active.add(key);
       let rp = renderPlayerPieces.get(key);
       if (!rp) {
-        rp = { x: piece.x, y: piece.y, radius: piece.radius };
+        rp = { x: piece.x, y: piece.y, radius: piece.radius, seenId };
         renderPlayerPieces.set(key, rp);
       }
-      const t = 1 - Math.pow(0.001, dt);
-      rp.x += (piece.x - rp.x) * t;
-      rp.y += (piece.y - rp.y) * t;
-      rp.radius += (piece.radius - rp.radius) * t;
+      rp.seenId = seenId;
+      rp.x += (piece.x - rp.x) * smoothT;
+      rp.y += (piece.y - rp.y) * smoothT;
+      rp.radius += (piece.radius - rp.radius) * smoothT;
     }
   }
-  for (const key of renderPlayerPieces.keys()) if (!active.has(key)) renderPlayerPieces.delete(key);
+  for (const [key, rp] of renderPlayerPieces) if (rp.seenId !== seenId) renderPlayerPieces.delete(key);
 }
 
 function smoothBots(dt) {
-  const bots = roomState?.bots || {};
-  const active = new Set();
-  const sourceEntries = localHost ? hostBots.entries() : Object.entries(bots);
+  const seenId = ++renderBotSeenId;
+  const smoothT = 1 - Math.pow(0.0007, dt);
+  const sourceEntries = localHost ? hostBots.entries() : remoteBotEntries;
   for (const [id, remote] of sourceEntries) {
     if (!remote || remote.eatenBy) continue;
-    active.add(id);
-    const target = remote;
     let rb = renderBots.get(id);
     if (!rb) {
-      rb = { x: target.x, y: target.y, radius: target.radius };
+      rb = { x: remote.x, y: remote.y, radius: remote.radius, seenId };
       renderBots.set(id, rb);
     }
-    const t = 1 - Math.pow(0.0007, dt);
-    rb.x += (target.x - rb.x) * t;
-    rb.y += (target.y - rb.y) * t;
-    rb.radius += (target.radius - rb.radius) * t;
+    rb.seenId = seenId;
+    rb.x += (remote.x - rb.x) * smoothT;
+    rb.y += (remote.y - rb.y) * smoothT;
+    rb.radius += (remote.radius - rb.radius) * smoothT;
   }
-  for (const id of renderBots.keys()) if (!active.has(id)) renderBots.delete(id);
+  for (const [id, rb] of renderBots) if (rb.seenId !== seenId) renderBots.delete(id);
 }
 
 function drawBots(cam) {
-  const sourceEntries = localHost ? hostBots.entries() : Object.entries(roomState?.bots || {});
+  const sourceEntries = localHost ? hostBots.entries() : remoteBotEntries;
+  const crowded = renderBots.size > 55;
   for (const [id, bot] of sourceEntries) {
     if (!bot || bot.eatenBy) continue;
     const rb = renderBots.get(id) || bot;
@@ -1826,23 +2048,20 @@ function drawBots(cam) {
     if (x < -r - 30 || y < -r - 30 || x > innerWidth + r + 30 || y > innerHeight + r + 30) continue;
 
     ctx.save();
-    if (r < LARGE_CELL_LOD_RADIUS) {
-      ctx.shadowColor = bot.color || "#ff5f6d";
-      ctx.shadowBlur = 14;
-    }
+    // Shadows on dozens of large circles are extremely expensive on Canvas2D.
+    // Bots use a flat silhouette; the player's own cell keeps a small glow below.
     ctx.beginPath();
     ctx.arc(x, y, r, 0, Math.PI * 2);
     ctx.fillStyle = bot.color || "#ff5f6d";
     ctx.fill();
-    ctx.shadowBlur = 0;
-    ctx.lineWidth = Math.max(2.5, Math.min(12, r * 0.075));
+    ctx.lineWidth = Math.max(2.5, Math.min(10, r * 0.065));
     ctx.strokeStyle = "rgba(80, 3, 20, .72)";
     ctx.stroke();
 
 
     // Detail LOD: giant cells are expensive mostly because of multiple large
     // alpha-blended shapes. Their silhouette/name is enough while zoomed in.
-    if (r < 340) {
+    if (!crowded && r >= 22 && r < 220) {
       const eyeY = y - r * 0.14;
       const eyeGap = r * 0.28;
       const eyeR = Math.max(2.5, r * 0.09);
@@ -1858,12 +2077,14 @@ function drawBots(cam) {
       }
     }
 
-    const fontSize = Math.max(9, Math.min(18, r * 0.38));
-    ctx.font = `900 ${fontSize}px Inter, system-ui, sans-serif`;
-    ctx.textAlign = "center";
-    ctx.textBaseline = "middle";
-    ctx.fillStyle = "rgba(54,7,18,.88)";
-    ctx.fillText(bot.name || "Enemy", x, y + Math.min(r * 0.28, 90));
+    if (r >= 34 && (!crowded || r >= 90)) {
+      const fontSize = Math.max(10, Math.min(17, r * 0.34));
+      ctx.font = `900 ${fontSize}px Inter, system-ui, sans-serif`;
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillStyle = "rgba(54,7,18,.88)";
+      ctx.fillText(bot.name || "Enemy", x, y + Math.min(r * 0.28, 90));
+    }
     ctx.restore();
   }
 }
@@ -1883,9 +2104,9 @@ function drawPlayers(cam) {
       ctx.save();
       // Large blurred circles are one of the most expensive canvas operations.
       // Keep the glow for normal cells, switch to a flat LOD for giant cells.
-      if (r < LARGE_CELL_LOD_RADIUS) {
+      if (p.uid === uid && r < 120) {
         ctx.shadowColor = p.color || "#fff";
-        ctx.shadowBlur = p.uid === uid ? 18 : 10;
+        ctx.shadowBlur = 8;
       }
       ctx.beginPath();
       ctx.arc(x, y, r, 0, Math.PI * 2);
@@ -1952,10 +2173,20 @@ function drawDirection() {
 }
 
 let lastFrame = performance.now();
+let lastRenderAt = 0;
 function frame(now) {
   const dt = Math.min(0.04, (now - lastFrame) / 1000);
   lastFrame = now;
+  if (!roomId) {
+    requestAnimationFrame(frame);
+    return;
+  }
   tickMovement(dt);
+  if (roomId && local && roomState && now - lastLocalCollisionAt >= LOCAL_COLLISION_INTERVAL_MS) {
+    lastLocalCollisionAt = now;
+    checkFoodCollisions();
+    checkBotCollisions();
+  }
   if (localHost && now - lastBotSimAt >= BOT_SIM_INTERVAL_MS) {
     const botDt = lastBotSimAt ? Math.min(0.06, (now - lastBotSimAt) / 1000) : dt;
     lastBotSimAt = now;
@@ -1963,16 +2194,26 @@ function frame(now) {
     hostResolvePvp(Date.now());
   }
   hostMaintenance(now);
-  smoothPlayerPieces(dt);
-  smoothBots(dt);
 
-  const cam = getCamera();
-  drawGrid(cam);
-  drawFood(cam);
-  drawBots(cam);
-  drawPlayers(cam);
-  drawDirection();
-  drawDeathNotice(now);
+  if (now - lastHudUpdateAt >= HUD_UPDATE_INTERVAL_MS) {
+    lastHudUpdateAt = now;
+    updateHud(roomState?.players || {}, roomState?.bots || {});
+  }
+
+  if (now - lastRenderAt >= MIN_RENDER_INTERVAL_MS) {
+    const renderDt = lastRenderAt ? Math.min(0.05, (now - lastRenderAt) / 1000) : dt;
+    lastRenderAt = now;
+    smoothPlayerPieces(renderDt);
+    smoothBots(renderDt);
+
+    const cam = getCamera();
+    drawGrid(cam);
+    drawFood(cam);
+    drawBots(cam);
+    drawPlayers(cam);
+    drawDirection();
+    drawDeathNotice(now);
+  }
   requestAnimationFrame(frame);
 }
 
