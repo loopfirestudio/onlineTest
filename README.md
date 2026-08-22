@@ -1,4 +1,4 @@
-# Blob Royale — Build 2.0.1 Performance
+# Blob Royale — Build 2.0.2 Smooth Bots
 
 A browser-based Agar.io-inspired **1–3 player PvPvE free-for-all** using Firebase Realtime Database.
 
@@ -53,7 +53,7 @@ The included ruleset is dedicated to this Agar.io FFA project and uses `/rooms`.
 
 ## Build 2.0.1-performance
 
-Gameplay unchanged. Performance pass: split Firebase listeners, 20 Hz host AI, 5 Hz bot position sync, spatial bot AI/cannibal collision grid, visible-only pellet rendering, throttled local collisions/HUD, reduced Canvas2D blur, and slower sync for non-visual bot AI state.
+Gameplay unchanged. Performance pass: split Firebase listeners, 20 Hz host AI, 8 Hz bot position sync + client prediction, spatial bot AI/cannibal collision grid, visible-only pellet rendering, throttled local collisions/HUD, reduced Canvas2D blur, and slower sync for non-visual bot AI state.
 
 ### Performance changes
 - Firebase listeners split by hot path; bot movement no longer rebuilds the complete room snapshot.
@@ -61,7 +61,7 @@ Gameplay unchanged. Performance pass: split Firebase listeners, 20 Hz host AI, 5
 - Join reads only metadata + player slots instead of downloading the full room first.
 - Host AI runs at 20 Hz and bot rendering/network interpolation remains smooth.
 - Host hunter/cannibal/rival searches and bot-vs-bot eating use a spatial grid instead of all-pairs scans.
-- Slow AI state sync is separated from 5 Hz position/size sync.
+- Slow AI state sync is separated from 8 Hz compact visual position/velocity sync.
 - Local pellet/bot collisions run ~29 Hz instead of every rendered frame.
 - Bot entry arrays are cached per network snapshot to reduce garbage collection.
 - Visible-only pellet rendering; fewer bot details during crowded split fights.
@@ -69,3 +69,14 @@ Gameplay unchanged. Performance pass: split Firebase listeners, 20 Hz host AI, 5
 - Full rendering is rate-limited on high-refresh displays while input/movement remain responsive.
 
 No database schema or rules changes are required versus Build 2.0.0.
+
+
+## Build 2.0.2-smooth-bots
+
+Remote bot motion fix:
+- Bot visual snapshots increased from 5 Hz to 8 Hz.
+- Bot updates use incremental child listeners instead of rebuilding the whole bot map.
+- Clients measure bot velocity from consecutive snapshots and dead-reckon between Firebase packets.
+- Short Firebase stalls no longer make bots freeze; new snapshots softly correct prediction error.
+- Host ignores its own ordinary movement echoes, avoiding extra host reconciliation work despite the higher visual sync rate.
+- No Firebase rules change is required.
